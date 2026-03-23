@@ -1,0 +1,21 @@
+{
+  "name": "stremio-anitube",
+  "version": "2.0.0",
+  "description": "Stremio Addon para AniTube.news – animes em português",
+  "main": "addon.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "dotenv": "^17.3.1",
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "MIT"
+}
