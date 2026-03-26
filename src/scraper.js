@@ -1,39 +1,60 @@
 'use strict';
 
 /**
- * Scraper para AniTube.news - Versão v3.2.1 (Restaurada v2.1.1)
+ * Scraper para AniTube.news — v3.2.7
  */
 
-const fetch = require('node-fetch');
+const fetch   = require('node-fetch');
 const cheerio = require('cheerio');
 
 const BASE_URL = 'https://www.anitube.news';
 
-const UA =
-  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36';
+const UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 ' +
+           '(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36';
 
 const FETCH_HEADERS = {
-  'User-Agent': UA,
-  Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
-  'Accept-Language': 'pt-BR,pt;q=0.9',
-  Referer: BASE_URL + '/',
+  'User-Agent'      : UA,
+  'Accept'          : 'text/html,application/xhtml+xml,*/*;q=0.8',
+  'Accept-Language' : 'pt-BR,pt;q=0.9',
+  'Referer'         : BASE_URL + '/',
 };
 
-async function fetchHTML(url, timeout = 15000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    const res = await fetch(url, { headers: FETCH_HEADERS, signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} para ${url}`);
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
+// ───────────────────────────────────────────────────────────────────────────
+// HTTP
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Busca HTML com retry automático (3 tentativas, backoff de 1 s).
+ * @param {string} url
+ * @param {number} [timeout=15000]
+ * @param {number} [retries=3]
+ */
+async function fetchHTML(url, timeout = 15000, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+      const res = await fetch(url, { headers: FETCH_HEADERS, signal: ctrl.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status} para ${url}`);
+      return await res.text();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      const wait = attempt * 1000;
+      console.warn(`[fetchHTML] Tentativa ${attempt} falhou para ${url}. Retry em ${wait}ms. Erro: ${err.message}`);
+      await new Promise(r => setTimeout(r, wait));
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// UTILITÁRIOS
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Extrai o ID numérico de uma URL do AniTube. */
 function extractId(url) {
-  if (!url) return null;
+  if (!url || typeof url !== 'string') return null;
   let m = url.match(/\/video\/(\d+)\/?/);
   if (m) return m[1];
   m = url.match(/\/(\d{4,})b/);
@@ -41,8 +62,9 @@ function extractId(url) {
   return null;
 }
 
+/** Limpa o título removendo sufixos de episódio e entidades HTML. */
 function cleanTitle(raw) {
-  if (!raw) return '';
+  if (!raw || typeof raw !== 'string') return '';
   return raw
     .replace(/\s*[–\-]\s*Todos os Epis.+$/i, '')
     .replace(/\s*[–\-]\s*Epis[oó]dio\s*\d+.*$/i, '')
@@ -52,7 +74,9 @@ function cleanTitle(raw) {
     .trim();
 }
 
+/** Tenta extrair o número do episódio a partir do título. */
 function extractEpisodeNumber(title) {
+  if (!title) return null;
   const patterns = [
     /Epis[oó]dio\s*(\d+)/i,
     /Ep\.?\s*(\d+)/i,
@@ -67,27 +91,48 @@ function extractEpisodeNumber(title) {
   return null;
 }
 
+/**
+ * Constrói um objeto meta mínimo (preview de catálogo).
+ * Garante `poster` como string válida (nunca undefined).
+ */
 function makeMetaPreview(id, name, poster) {
   return {
-    id: `anitube:${id}`,
-    type: 'series',
-    name: cleanTitle(name),
-    poster: poster || '',
-    posterShape: 'poster',
+    id          : `anitube:${id}`,
+    type        : 'series',
+    name        : cleanTitle(name),
+    poster      : poster || '',
+    posterShape : 'poster',
   };
 }
 
-function parseAniItems($, selector) {
+/**
+ * Extrai a imagem preferindo `src` mas fazendo fallback para
+ * `data-src` (lazy-load) e depois `data-lazy-src`.
+ */
+function extractImgSrc($el) {
+  return (
+    $el.attr('src') ||
+    $el.attr('data-src') ||
+    $el.attr('data-lazy-src') ||
+    ''
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// PARSERS
+// ───────────────────────────────────────────────────────────────────────────
+
+function parseAniItems($, $elements) {
   const results = [];
-  const seen = new Set();
-  $(selector).each((_, el) => {
-    const $a = $(el).find('a').first();
+  const seen    = new Set();
+  $elements.each((_, el) => {
+    const $a   = $(el).find('a').first();
     const href = $a.attr('href') || '';
-    const id = extractId(href);
+    const id   = extractId(href);
     if (!id || seen.has(id)) return;
     seen.add(id);
-    const name = $a.attr('title') || $(el).find('.aniItemNome').first().text().trim() || '';
-    const poster = $(el).find('img').first().attr('src') || $(el).find('img').first().attr('data-src') || '';
+    const name   = $a.attr('title') || $(el).find('.aniItemNome').first().text().trim();
+    const poster = extractImgSrc($(el).find('img').first());
     if (!name) return;
     results.push(makeMetaPreview(id, name, poster));
   });
@@ -96,64 +141,88 @@ function parseAniItems($, selector) {
 
 function parseEpiItems($) {
   const results = [];
-  const seen = new Set();
+  const seen    = new Set();
   $('div.epiItem').each((_, el) => {
-    const $a = $(el).find('a').first();
+    const $a   = $(el).find('a').first();
     const href = $a.attr('href') || '';
-    const id = extractId(href);
+    const id   = extractId(href);
     if (!id || seen.has(id)) return;
     seen.add(id);
-    const rawName = $a.attr('title') || $(el).find('.epiItemNome').first().text().trim() || '';
-    const poster = $(el).find('img').first().attr('src') || $(el).find('img').first().attr('data-src') || '';
+    const rawName = ($a.attr('title') || $(el).find('.epiItemNome').first().text()).trim();
+    const poster  = extractImgSrc($(el).find('img').first());
     if (!rawName) return;
     results.push({
-      id: `anitube:${id}`,
-      type: 'series',
-      name: rawName.trim(),
+      id          : `anitube:${id}`,
+      type        : 'series',
+      name        : rawName,
       poster,
-      posterShape: 'poster',
+      posterShape : 'poster',
     });
   });
   return results;
 }
 
-async function getLatestEpisodes() {
-  const html = await fetchHTML(BASE_URL + '/');
-  const $ = cheerio.load(html);
+/**
+ * Percorre os `.aniContainer` e retorna o que contém algum dos `keywords`
+ * no título, ou `null` se nenhum for encontrado.
+ * @param {CheerioStatic} $
+ * @param {string[]} keywords
+ */
+function findContainerByKeywords($, keywords) {
+  let found = null;
+  $('.aniContainer').each((_, container) => {
+    if (found) return false; // break
+    const title = $(container).find('.aniContainerTitulo').first().text().toLowerCase();
+    if (keywords.some(k => title.includes(k.toLowerCase()))) {
+      found = container;
+    }
+  });
+  return found;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// SCRAPING – HOME (compartilhado entre getLatest / getMostWatched / getRecent)
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Cache interno da home para evitar 3 GETs na mesma renderização. */
+let _homeCache    = null;
+let _homeCacheTs  = 0;
+const HOME_TTL_MS = 60 * 1000; // 1 min
+
+async function getHomePage() {
+  if (_homeCache && Date.now() - _homeCacheTs < HOME_TTL_MS) return _homeCache;
+  _homeCache   = cheerio.load(await fetchHTML(BASE_URL + '/'));
+  _homeCacheTs = Date.now();
+  return _homeCache;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FUNÇÕES PÚBLICAS
+// ───────────────────────────────────────────────────────────────────────────
+
+/** @param {number} [_page] reservado para compatibilidade futura */
+async function getLatestEpisodes(_page) {
+  const $ = await getHomePage();
   return parseEpiItems($);
 }
 
-async function getMostWatched() {
-  const html = await fetchHTML(BASE_URL + '/');
-  const $ = cheerio.load(html);
-  let targetContainer = null;
-  $('.aniContainer').each((_, container) => {
-    if (targetContainer) return;
-    const title = $(container).find('.aniContainerTitulo').first().text();
-    if (title.toLowerCase().includes('mais vistos') || title.includes('ほとんど見た')) {
-      targetContainer = container;
-    }
-  });
-  if (targetContainer) {
-    const items = parseAniItems($, $(targetContainer).find('.aniItem'));
+/** @param {number} [_page] reservado para compatibilidade futura */
+async function getMostWatched(_page) {
+  const $ = await getHomePage();
+  const container = findContainerByKeywords($, ['mais vistos', 'ほとんど見た']);
+  if (container) {
+    const items = parseAniItems($, $(container).find('.aniItem'));
     if (items.length > 0) return items;
   }
-  return parseAniItems($, '.aniContainer:first-child .aniItem');
+  return parseAniItems($, $('.aniContainer').first().find('.aniItem'));
 }
 
-async function getRecentAnimes() {
-  const html = await fetchHTML(BASE_URL + '/');
-  const $ = cheerio.load(html);
-  let targetContainer = null;
-  $('.aniContainer').each((_, container) => {
-    if (targetContainer) return;
-    const title = $(container).find('.aniContainerTitulo').first().text();
-    if (title.toLowerCase().includes('recentes') || title.includes('最近')) {
-      targetContainer = container;
-    }
-  });
-  if (targetContainer) {
-    const items = parseAniItems($, $(targetContainer).find('.aniItem'));
+/** @param {number} [_page] reservado para compatibilidade futura */
+async function getRecentAnimes(_page) {
+  const $ = await getHomePage();
+  const container = findContainerByKeywords($, ['recentes', '最近']);
+  if (container) {
+    const items = parseAniItems($, $(container).find('.aniItem'));
     if (items.length > 0) return items;
   }
   const containers = $('.aniContainer').toArray();
@@ -162,111 +231,31 @@ async function getRecentAnimes() {
 }
 
 async function getAnimeList(page = 1) {
-  const url = page === 1 ? `${BASE_URL}/lista-de-animes-online/` : `${BASE_URL}/lista-de-animes-online/page/${page}/`;
+  const url  = page === 1
+    ? `${BASE_URL}/lista-de-animes-online/`
+    : `${BASE_URL}/lista-de-animes-online/page/${page}/`;
   const html = await fetchHTML(url);
-  const $ = cheerio.load(html);
-  return parseAniItems($, 'div.aniItem');
+  const $    = cheerio.load(html);
+  return parseAniItems($, $('div.aniItem'));
 }
 
 async function searchAnimes(query) {
-  const url = `${BASE_URL}/?s=${encodeURIComponent(query)}`;
+  if (!query || !query.trim()) return [];
+  const url  = `${BASE_URL}/?s=${encodeURIComponent(query.trim())}`;
   const html = await fetchHTML(url);
-  const $ = cheerio.load(html);
-  const aniResults = parseAniItems($, 'div.aniItem');
+  const $    = cheerio.load(html);
+  const aniResults = parseAniItems($, $('div.aniItem'));
   if (aniResults.length > 0) return aniResults;
   return parseEpiItems($);
 }
 
 async function getAnimeMeta(animeId) {
-  const url = `${BASE_URL}/video/${animeId}/`;
+  const url  = `${BASE_URL}/video/${animeId}/`;
   const html = await fetchHTML(url);
-  const $ = cheerio.load(html);
-  const rawTitle = $('h1').first().text().trim() || $('title').first().text().split('–')[0].trim();
-  const title = cleanTitle(rawTitle);
-  const poster = $('#capaAnime img').first().attr('src') || $('meta[property="og:image"]').attr('content') || '';
-  const description = $('#sinopse2').text().trim() || $('meta[name="description"]').attr('content') || '';
-  const genres = [];
-  let year = '';
-  $('.boxAnimeSobre .boxAnimeSobreLinha').each((_, el) => {
-    const text = $(el).text().trim();
-    if (text.startsWith('Gênero:')) {
-      genres.push(...text.replace('Gênero:', '').split(',').map((s) => s.trim()).filter(Boolean));
-    } else if (text.startsWith('Ano:')) {
-      year = text.replace('Ano:', '').trim();
-    }
-  });
-  const videos = [];
-  $('.pagAniListaContainer a').each((i, el) => {
-    const href = $(el).attr('href') || '';
-    const epId = extractId(href);
-    if (!epId) return;
-    const epTitle = $(el).attr('title') || $(el).text().trim() || `Episódio ${i + 1}`;
-    const epNum = extractEpisodeNumber(epTitle) || (epTitle.match(/\b(\d+)\b/) ? parseInt(epTitle.match(/\b(\d+)\b/)[1], 10) : i + 1);
-    videos.push({
-      id: `anitube:${epId}`,
-      title: `Episódio ${epNum}`,
-      season: 1,
-      episode: epNum,
-      released: new Date(0).toISOString(),
-    });
-  });
-  if (videos.length === 0 && url.includes('/video/')) {
-    const epNum = extractEpisodeNumber(rawTitle) || 1;
-    videos.push({
-      id: `anitube:${animeId}`,
-      title: `Episódio ${epNum}`,
-      season: 1,
-      episode: epNum,
-      released: new Date(0).toISOString(),
-    });
-  }
-  videos.sort((a, b) => a.episode - b.episode);
-  return {
-    meta: {
-      id: `anitube:${animeId}`,
-      type: 'series',
-      name: title,
-      poster,
-      posterShape: 'poster',
-      background: $('meta[property="og:image"]').attr('content') || poster,
-      description,
-      genres,
-      year: year || undefined,
-      website: url,
-      videos,
-    },
-  };
-}
+  const $    = cheerio.load(html);
 
-async function getEpisodeIframes(epId) {
-  const url = `${BASE_URL}/video/${epId}/`;
-  const html = await fetchHTML(url);
-  const $ = cheerio.load(html);
-  const sources = [];
-  $('div.pagEpiAbasItem').each((_, aba) => {
-    const tabName = $(aba).text().trim() || 'Player';
-    const tabTarget = $(aba).attr('aba-target');
-    if (!tabTarget) return;
-    const container = $(`div#${tabTarget}`);
-    if (!container.length) return;
-    // O seletor .metaframe é fundamental!
-    const iframeSrc = container.find('iframe.metaframe').first().attr('src');
-    if (!iframeSrc) return;
-    sources.push({ name: tabName, iframeSrc, containerId: tabTarget });
-  });
-  return { sources, episodeUrl: url };
-}
-
-module.exports = {
-  getLatestEpisodes,
-  getMostWatched,
-  getRecentAnimes,
-  getAnimeList,
-  searchAnimes,
-  getAnimeMeta,
-  getEpisodeIframes,
-  extractId,
-  cleanTitle,
-  fetchHTML,
-  BASE_URL,
-};
+  const rawTitle = $('h1').first().text().trim() ||
+                   $('title').first().text().split('–')[0].trim();
+  const title      = cleanTitle(rawTitle);
+  const ogImage    = $('meta[property="og:image"]').attr('content') || '';
+  const poster     = extractImgSrc($('#capaAnime img').first())
