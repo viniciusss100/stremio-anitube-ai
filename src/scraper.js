@@ -258,4 +258,121 @@ async function getAnimeMeta(animeId) {
                    $('title').first().text().split('–')[0].trim();
   const title      = cleanTitle(rawTitle);
   const ogImage    = $('meta[property="og:image"]').attr('content') || '';
-  const poster     = extractImgSrc($('#capaAnime img').first())
+  const poster     = extractImgSrc($('#capaAnime img').first()) || ogImage;
+  const description =
+    $('#sinopse2').text().trim() ||
+    $('meta[name="description"]').attr('content') ||
+    '';
+
+  const genres = [];
+  let year = '';
+
+  $('.boxAnimeSobre .boxAnimeSobreLinha').each((_, el) => {
+    const text = $(el).text().trim();
+    if (text.startsWith('Gênero:')) {
+      genres.push(
+        ...text.replace('Gênero:', '').split(',').map(s => s.trim()).filter(Boolean)
+      );
+    } else if (text.startsWith('Ano:')) {
+      year = text.replace('Ano:', '').trim();
+    }
+  });
+
+  const videos    = [];
+  const seenEpIds = new Set();
+
+  $('.pagAniListaContainer a').each((i, el) => {
+    const href = $(el).attr('href') || '';
+    const epId = extractId(href);
+    if (!epId || seenEpIds.has(epId)) return;
+    seenEpIds.add(epId);
+
+    const epTitle = $(el).attr('title') || $(el).text().trim() || `Episódio ${i + 1}`;
+    const matchNum = epTitle.match(/\b(\d+)\b/);
+    const epNum   = extractEpisodeNumber(epTitle) ||
+                    (matchNum ? parseInt(matchNum[1], 10) : i + 1);
+
+    videos.push({
+      id       : `anitube:${epId}`,
+      title    : `Episódio ${epNum}`,
+      season   : 1,
+      episode  : epNum,
+      released : new Date(0).toISOString(),
+    });
+  });
+
+  // Fallback: página de episódio único
+  if (videos.length === 0) {
+    const epNum = extractEpisodeNumber(rawTitle) || 1;
+    videos.push({
+      id       : `anitube:${animeId}`,
+      title    : `Episódio ${epNum}`,
+      season   : 1,
+      episode  : epNum,
+      released : new Date(0).toISOString(),
+    });
+  }
+
+  videos.sort((a, b) => a.episode - b.episode);
+
+  return {
+    meta: {
+      id          : `anitube:${animeId}`,
+      type        : 'series',
+      name        : title,
+      poster,
+      posterShape : 'poster',
+      background  : ogImage || poster,
+      description,
+      genres,
+      year        : year || undefined,
+      website     : url,
+      videos,
+    },
+  };
+}
+
+async function getEpisodeIframes(epId) {
+  const url  = `${BASE_URL}/video/${epId}/`;
+  const html = await fetchHTML(url);
+  const $    = cheerio.load(html);
+  const sources = [];
+
+  $('div.pagEpiAbasItem').each((_, aba) => {
+    const tabName   = $(aba).text().trim() || 'Player';
+    const tabTarget = $(aba).attr('aba-target');
+    if (!tabTarget) return;
+
+    const container = $(`div#${tabTarget}`);
+    if (!container.length) return;
+
+    // Tenta iframe.metaframe primeiro, depois qualquer iframe com src http
+    const iframeSrc =
+      container.find('iframe.metaframe').first().attr('src') ||
+      container.find('iframe[src^="http"]').first().attr('src');
+
+    if (!iframeSrc) return;
+    sources.push({ name: tabName, iframeSrc, containerId: tabTarget });
+  });
+
+  return { sources, episodeUrl: url };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// EXPORTS
+// ───────────────────────────────────────────────────────────────────────────
+module.exports = {
+  getLatestEpisodes,
+  getMostWatched,
+  getRecentAnimes,
+  getAnimeList,
+  searchAnimes,
+  getAnimeMeta,
+  getEpisodeIframes,
+  // utilitários exportados para testes unitários
+  extractId,
+  cleanTitle,
+  extractEpisodeNumber,
+  fetchHTML,
+  BASE_URL,
+};
