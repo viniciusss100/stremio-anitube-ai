@@ -17,13 +17,12 @@ const manifest = {
   id: 'community.anitube.superflix.v7',
   version: '7.0.0',
   name: '🎌🎬 AniTube + SuperFlix BR',
-  description: 'AniTube.news (animes) + SuperFlixAPI (filmes/séries BR) com streams reais.',
+  description: 'AniTube.news (animes) + SuperFlixAPI (filmes/séries BR).',
   logo: 'https://www.anitube.news/wp-content/uploads/logo-anitube-2.png',
   background: 'https://www.anitube.news/wp-content/themes/anitube/img/bg.jpg',
   resources: ['catalog', 'meta', 'stream'],
   types: ['series', 'movie', 'anime'],
-  // ADICIONADO: 'kitsu:' para suportar catálogos como AniList e Kitsu
-  idPrefixes: ['anitube:', 'tt', 'kitsu:'], 
+  idPrefixes: ['anitube:', 'tt', 'kitsu:'],
   behaviorHints: { configurable: false, adult: false },
   catalogs: [
     { id: 'anitube_search',      type: 'series', name: '🔍 AniTube – Busca',             extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }] },
@@ -146,15 +145,12 @@ builder.defineStreamHandler(async ({ id, type }) => {
       const episode = parts[2] !== undefined ? parseInt(parts[2], 10) : null;
       const isMovie = (type === 'movie');
 
-      // SuperFlix (Sempre no navegador)
       const sfStreams = sf.buildSFStreams(imdbId, isMovie ? 'movie' : 'series', season, episode);
       streams.push(...sfStreams);
 
-      // Provedores (Tentativa de extrair link nativo)
       const scrapedStreams = await getAllStreams(imdbId, type, season, episode);
       streams.push(...scrapedStreams);
 
-      // Fallback AniTube para séries/animes do Cinemeta (Toca Nativo)
       if (!isMovie) {
         const atStreams = await tryAniTubeFallback(id, type, season, episode);
         streams.push(...atStreams);
@@ -166,7 +162,6 @@ builder.defineStreamHandler(async ({ id, type }) => {
       const parts = id.split(':');
       const episode = parts[2] ? parseInt(parts[2], 10) : 1;
       
-      // Fallback AniTube para Kitsu (Toca Nativo)
       const atStreams = await tryAniTubeFallback(id, type, 1, episode);
       streams.push(...atStreams);
     }
@@ -181,45 +176,87 @@ builder.defineStreamHandler(async ({ id, type }) => {
   }
 });
 
-// ── Fallback AniTube Otimizado (Suporta Cinemeta e Kitsu) ──────────────────────
+// ── Fallback AniTube Otimizado ───────────────────────────────────────────
 async function tryAniTubeFallback(stremioId, type, season, episode) {
   try {
     const fetch = require('node-fetch');
     let title = null;
+    let aliases = [];
 
-    // 1. Resolve o ID para o Nome do Anime
+    // 1. Resolve o ID para o Nome do Anime (Cinemeta ou Kitsu)
     if (stremioId.startsWith('tt')) {
       const imdbId = stremioId.split(':')[0];
       const cinType = type === 'movie' ? 'movie' : 'series';
       const r = await fetch(`https://v3-cinemeta.strem.io/meta/${cinType}/${imdbId}.json`, { timeout: 8000 });
-      if (r.ok) { const j = await r.json(); title = j?.meta?.name || null; }
+      if (r.ok) { 
+        const j = await r.json(); 
+        title = j?.meta?.name || null; 
+        aliases = j?.meta?.aliases || [];
+      }
     } else if (stremioId.startsWith('kitsu:')) {
       const kitsuId = stremioId.split(':')[0] + ':' + stremioId.split(':')[1];
       const r = await fetch(`https://anime-kitsu.strem.fun/meta/anime/${kitsuId}.json`, { timeout: 8000 });
-      if (r.ok) { const j = await r.json(); title = j?.meta?.name || null; }
+      if (r.ok) { 
+        const j = await r.json(); 
+        title = j?.meta?.name || null;
+        aliases = j?.meta?.aliases || [];
+      }
     }
 
     if (!title) return [];
 
-    // Limpa marcações como (Dub) do título para achar no AniTube
-    const cleanTitle = title.replace(/\(Dub\)/i, '').split('-')[0].trim();
+    console.log(`[AniTube Fallback] Buscando: "${title}"`);
+
+    // 2. Prepara termos de busca (para burlar diferenças de nome EN vs JP)
+    const searchQueries = new Set();
     
-    // 2. Busca no AniTube
-    const results = await scraper.searchAnimes(cleanTitle);
-    if (!results?.length) return [];
+    // Título base limpo
+    const cleanTitle = title.replace(/\(Dub\)/i, '').split(':')[0].split('-')[0].trim();
+    searchQueries.add(cleanTitle);
+    searchQueries.add(title.replace(/\(Dub\)/i, '').trim());
+
+    // Adiciona os nomes alternativos fornecidos pela API
+    if (Array.isArray(aliases)) {
+      aliases.forEach(a => {
+        if (typeof a === 'string') {
+          searchQueries.add(a.replace(/\(Dub\)/i, '').split(':')[0].split('-')[0].trim());
+        }
+      });
+    }
+
+    let results = [];
+    let matchedQuery = '';
+
+    // Tenta buscar no AniTube com as variações do nome
+    for (const query of searchQueries) {
+      if (!query || query.length < 2) continue;
+      results = await scraper.searchAnimes(query);
+      if (results && results.length > 0) {
+        matchedQuery = query;
+        break;
+      }
+    }
+
+    if (!results || !results.length) return [];
+    console.log(`[AniTube Fallback] Encontrado usando: "${matchedQuery}"`);
 
     const animeId = results[0].id.replace('anitube:', '');
     let epId = animeId;
 
-    // 3. Encontra o Episódio
-    if (season !== null && episode !== null && type !== 'movie') {
+    // 3. Mapeamento de Episódio
+    if (episode !== null && type !== 'movie') {
       const meta = await scraper.getAnimeMeta(animeId);
       const videos = meta?.meta?.videos || [];
-      const ep = videos.find(v => v.episode === episode) || videos[episode - 1] || videos[0];
+      
+      let ep = videos.find(v => v.episode === episode);
+      if (!ep) {
+        ep = videos[episode - 1]; // Tenta pelo índice se a numeração não bater
+      }
+      
       if (ep) epId = ep.id.replace('anitube:', '');
     }
 
-    // 4. Extrai a Stream Direta (Nativa)
+    // 4. Extrai o link
     const sr = await scraper.getEpisodeIframes(epId);
     if (!sr?.sources?.length) return [];
     const st = await extractStreams(sr.sources, sr.episodeUrl);
