@@ -1,393 +1,199 @@
 'use strict';
 
 /**
- * providers.js — v2.0.0
- *
- * Provedores de stream por ID IMDB/TMDB — sem scraping, sem Cloudflare.
- *
- * Estratégia:
- *   O Stremio não consegue reproduzir players embed diretamente (são páginas HTML).
- *   Para cada provedor, nosso servidor faz a requisição, extrai a URL real
- *   do stream (M3U8 / MP4) do HTML/JS da página, e entrega ao Stremio.
- *
- * Provedores integrados (todos gratuitos, sem chave de API):
- *   1. VidSrc.cc    — maior cobertura, múltiplos servidores, HLS
- *   2. AutoEmbed    — player.autoembed.cc, retorna JSON com fontes
- *   3. 2Embed       — 2embed.stream, HLS em múltiplas qualidades
- *   4. SuperFlixAPI — superflixapi.run (com Referer correto via proxy)
- *   5. GoDrivePlayer— player.php?imdb=, HLS direto
+ * providers.js — v3.0.0
+ * CORREÇÕES:
+ *  - Bug "SnullEnull" corrigido: isMovie agora depende de type==='movie', não de season===null
+ *  - season/episode sempre têm fallback para 1 quando série
+ *  - Domínios atualizados: autoembed.cc (sem player.), vidsrc.me adicionado
+ *  - Novo provedor: multiembed.mov (SuperEmbed VIP)
  */
 
-const fetch  = require('node-fetch');
-const crypto = require('crypto');
+const fetch = require('node-fetch');
 
-const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-                   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 ' +
-                   '(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+           '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const PORT       = parseInt(process.env.PORT || '7000', 10);
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 
-// ── HTTP helper ───────────────────────────────────────────────────────────────
 async function safeFetch(url, opts = {}, timeout = 15000) {
-  const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+  const ctrl = new AbortController();
+  const t    = setTimeout(() => ctrl.abort(), timeout);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+  finally { clearTimeout(t); }
 }
 
-// ── Proxy M3U8 helper — envolve URL no proxy local ───────────────────────────
-function proxyM3U8(url, referer) {
-  return `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(referer || '')}`;
+function proxyM3U8(url, ref) {
+  return `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(ref || '')}`;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// PROVEDOR 1: VidSrc.cc
-// Documentação: https://vidsrc.cc
-// Endpoint filme: https://vidsrc.cc/v2/embed/movie/{imdbId}
-// Endpoint série: https://vidsrc.cc/v2/embed/tv/{imdbId}/{season}/{episode}
-// Estratégia: fetch da página → extrai sourceUrl da chamada JS interna
-// ────────────────────────────────────────────────────────────────────────────
-async function extractVidSrc(imdbId, type, season, episode) {
-  const streams = [];
-  try {
-    const isMovie = type === 'movie';
-    const pageUrl = isMovie
-      ? `https://vidsrc.cc/v2/embed/movie/${imdbId}`
-      : `https://vidsrc.cc/v2/embed/tv/${imdbId}/${season || 1}/${episode || 1}`;
-
-    const res = await safeFetch(pageUrl, {
-      headers: { 'User-Agent': UA_DESKTOP, Referer: 'https://vidsrc.cc/' },
-    });
-    if (!res.ok) return streams;
-    const html = await res.text();
-
-    // VidSrc carrega fontes via script — procura apiUrl ou sourceUrl
-    const apiMatch =
-      html.match(/sourceUrl\s*[=:]\s*["']([^"']+\.m3u8[^"']*)/i) ||
-      html.match(/file\s*:\s*["']([^"']+\.m3u8[^"']*)/i) ||
-      html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)/i);
-
-    if (apiMatch) {
-      streams.push({
-        url        : proxyM3U8(apiMatch[1], pageUrl),
-        name       : '📺 VidSrc',
-        description: 'VidSrc.cc • HLS',
-        behaviorHints: { notWebReady: false },
-      });
+function extractMedia(html, pageUrl) {
+  const out  = [];
+  const seen = new Set();
+  const pats = [
+    /["'`](https?:\/\/[^"'`<>\s]+\.m3u8[^"'`<>\s]*)/gi,
+    /file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
+    /hls\s*[=:]\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
+  ];
+  for (const p of pats) {
+    let m;
+    while ((m = p.exec(html)) !== null) {
+      if (!seen.has(m[1])) { seen.add(m[1]); out.push({ url: proxyM3U8(m[1], pageUrl), hls: true }); }
     }
-
-    // VidSrc às vezes retorna o endpoint de sources via JSON interno
-    const srcJsonMatch = html.match(/srcs\s*[:=]\s*(\[[^\]]+\])/);
-    if (srcJsonMatch) {
-      try {
-        const srcs = JSON.parse(srcJsonMatch[1]);
-        for (const s of srcs) {
-          const u = s.file || s.src || s.url;
-          if (u && u.includes('.m3u8')) {
-            streams.push({
-              url        : proxyM3U8(u, pageUrl),
-              name       : `📺 VidSrc (${s.label || 'HLS'})`,
-              description: `VidSrc.cc • ${s.label || 'HLS'}`,
-              behaviorHints: { notWebReady: false },
-            });
-          }
-        }
-      } catch (_) {}
-    }
-  } catch (e) {
-    console.warn('[VidSrc] Erro:', e.message);
   }
-  return streams;
+  if (!out.length) {
+    const mp4 = html.match(/["'](https?:\/\/[^"'<>\s]+\.mp4[^"'<>\s]*)/i);
+    if (mp4) out.push({ url: mp4[1], hls: false });
+  }
+  return out;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// PROVEDOR 2: AutoEmbed (player.autoembed.cc)
-// Endpoint filme: https://player.autoembed.cc/embed/movie/{imdbId}
-// Endpoint série: https://player.autoembed.cc/embed/tv/{imdbId}/{season}/{episode}
-// Tem API JSON: /api/getVideoSource?type=movie&id={imdbId}
-// ────────────────────────────────────────────────────────────────────────────
-async function extractAutoEmbed(imdbId, type, season, episode) {
-  const streams = [];
-  try {
-    const isMovie = type === 'movie';
+function makeStream(name, desc, media) {
+  return { url: media.url, name, description: `${desc} • ${media.hls ? 'HLS' : 'MP4'}`, behaviorHints: { notWebReady: false } };
+}
 
-    // Tenta API JSON primeiro (mais confiável)
+// Provedor 1: VidSrc.cc
+async function extractVidSrc(id, isMovie, s, e) {
+  try {
+    const url = isMovie ? `https://vidsrc.cc/v2/embed/movie/${id}` : `https://vidsrc.cc/v2/embed/tv/${id}/${s}/${e}`;
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, Referer: 'https://vidsrc.cc/' } });
+    if (!res.ok) return [];
+    return extractMedia(await res.text(), url).map(m => makeStream('📺 VidSrc', 'VidSrc.cc', m));
+  } catch (err) { console.warn('[VidSrc] Erro:', err.message); return []; }
+}
+
+// Provedor 2: VidSrc.me (domínio original)
+async function extractVidSrcMe(id, isMovie, s, e) {
+  try {
+    const url = isMovie
+      ? `https://vidsrc.me/embed/movie?imdb=${id}`
+      : `https://vidsrc.me/embed/tv?imdb=${id}&season=${s}&episode=${e}`;
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, Referer: 'https://vidsrc.me/' } });
+    if (!res.ok) return [];
+    return extractMedia(await res.text(), url).map(m => makeStream('📺 VidSrc.me', 'VidSrc.me', m));
+  } catch (err) { console.warn('[VidSrc.me] Erro:', err.message); return []; }
+}
+
+// Provedor 3: AutoEmbed (autoembed.cc — sem "player." no domínio)
+async function extractAutoEmbed(id, isMovie, s, e) {
+  try {
+    // API JSON (mais confiável)
     const apiUrl = isMovie
-      ? `https://player.autoembed.cc/api/getVideoSource?type=movie&id=${imdbId}`
-      : `https://player.autoembed.cc/api/getVideoSource?type=tv&id=${imdbId}&season=${season || 1}&episode=${episode || 1}`;
-
-    const apiRes = await safeFetch(apiUrl, {
-      headers: { 'User-Agent': UA_DESKTOP, Referer: 'https://autoembed.cc/', Accept: 'application/json' },
-    });
-
-    if (apiRes.ok) {
-      const json = await apiRes.json();
-      // Resposta: { videoSource: "https://...m3u8", subtitles: [...] }
-      const src = json?.videoSource || json?.source || json?.url;
-      if (src && (src.includes('.m3u8') || src.includes('.mp4'))) {
-        const isHLS = src.includes('.m3u8');
-        streams.push({
-          url        : isHLS ? proxyM3U8(src, 'https://player.autoembed.cc/') : src,
-          name       : '🎬 AutoEmbed',
-          description: `AutoEmbed • ${isHLS ? 'HLS' : 'MP4'}`,
-          behaviorHints: { notWebReady: false },
-        });
+      ? `https://autoembed.cc/api/getVideoSource?type=movie&id=${id}`
+      : `https://autoembed.cc/api/getVideoSource?type=tv&id=${id}&season=${s}&episode=${e}`;
+    const res = await safeFetch(apiUrl, { headers: { 'User-Agent': UA, Referer: 'https://autoembed.cc/', Accept: 'application/json' } });
+    if (res.ok) {
+      const json = await res.json();
+      const src  = json?.videoSource || json?.source || json?.url;
+      if (src) {
+        const hls = src.includes('.m3u8');
+        return [makeStream('🎬 AutoEmbed', 'AutoEmbed', { url: hls ? proxyM3U8(src, 'https://autoembed.cc/') : src, hls })];
       }
     }
+    // Fallback embed page
+    const embedUrl = isMovie
+      ? `https://autoembed.cc/movie/imdb/${id}`
+      : `https://autoembed.cc/tv/imdb/${id}-${s}-${e}`;
+    const r2 = await safeFetch(embedUrl, { headers: { 'User-Agent': UA, Referer: 'https://autoembed.cc/' } });
+    if (!r2.ok) return [];
+    return extractMedia(await r2.text(), embedUrl).map(m => makeStream('🎬 AutoEmbed', 'AutoEmbed', m));
+  } catch (err) { console.warn('[AutoEmbed] Erro:', err.message); return []; }
+}
 
-    // Fallback: página HTML
+// Provedor 4: 2Embed
+async function extract2Embed(id, isMovie, s, e) {
+  try {
+    const url = isMovie
+      ? `https://www.2embed.stream/embed/movie/${id}`
+      : `https://www.2embed.stream/embed/tv/${id}/${s}/${e}`;
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, Referer: 'https://www.2embed.stream/' } });
+    if (!res.ok) return [];
+    return extractMedia(await res.text(), url).map(m => makeStream('📡 2Embed', '2Embed', m));
+  } catch (err) { console.warn('[2Embed] Erro:', err.message); return []; }
+}
+
+// Provedor 5: MultiEmbed/SuperEmbed VIP (HLS direto)
+async function extractMultiEmbed(id, isMovie, s, e) {
+  try {
+    const url = isMovie
+      ? `https://multiembed.mov/directstream.php?video_id=${id}`
+      : `https://multiembed.mov/directstream.php?video_id=${id}&s=${s}&e=${e}`;
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, Referer: 'https://multiembed.mov/' }, redirect: 'follow' });
+    if (!res.ok) return [];
+    return extractMedia(await res.text(), url).map(m => makeStream('🌐 SuperEmbed', 'SuperEmbed VIP', m));
+  } catch (err) { console.warn('[MultiEmbed] Erro:', err.message); return []; }
+}
+
+// Provedor 6: SuperFlixAPI (com Referer correto)
+async function extractSuperFlix(id, isMovie, s, e) {
+  try {
+    const SF = (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, '');
+    const url = isMovie ? `${SF}/filme/${id}` : `${SF}/serie/${id}/${s}/${e}`;
+    const res = await safeFetch(url, {
+      headers: { 'User-Agent': UA, Referer: `${SF}/doc`, Origin: SF, Accept: 'text/html,*/*' },
+    });
+    if (!res.ok) return [];
+    const html    = await res.text();
+    const medias  = extractMedia(html, url);
+    const streams = medias.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
+
+    // Tenta iframe aninhado se não achou nada
     if (!streams.length) {
-      const pageUrl = isMovie
-        ? `https://player.autoembed.cc/embed/movie/${imdbId}`
-        : `https://player.autoembed.cc/embed/tv/${imdbId}/${season || 1}/${episode || 1}`;
-
-      const res = await safeFetch(pageUrl, {
-        headers: { 'User-Agent': UA_DESKTOP, Referer: 'https://autoembed.cc/' },
-      });
-      if (res.ok) {
-        const html = await res.text();
-        const m    = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)/i);
-        if (m) {
-          streams.push({
-            url        : proxyM3U8(m[1], pageUrl),
-            name       : '🎬 AutoEmbed',
-            description: 'AutoEmbed • HLS',
-            behaviorHints: { notWebReady: false },
-          });
+      const im = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+      if (im) {
+        const nested = im[1].startsWith('//') ? 'https:' + im[1] : im[1];
+        const r2 = await safeFetch(nested, { headers: { 'User-Agent': UA, Referer: url } });
+        if (r2.ok) {
+          extractMedia(await r2.text(), nested).forEach(m =>
+            streams.push(makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m))
+          );
         }
       }
     }
-  } catch (e) {
-    console.warn('[AutoEmbed] Erro:', e.message);
-  }
-  return streams;
+    return streams;
+  } catch (err) { console.warn('[SuperFlix] Erro:', err.message); return []; }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// PROVEDOR 3: 2Embed (2embed.stream)
-// Endpoint filme: https://www.2embed.stream/embed/movie/{imdbId}
-// Endpoint série: https://www.2embed.stream/embed/tv/{imdbId}/{season}/{episode}
-// ────────────────────────────────────────────────────────────────────────────
-async function extract2Embed(imdbId, type, season, episode) {
-  const streams = [];
+// Provedor 7: GoDrivePlayer
+async function extractGoDrive(id, isMovie, s, e) {
   try {
-    const isMovie = type === 'movie';
-    const pageUrl = isMovie
-      ? `https://www.2embed.stream/embed/movie/${imdbId}`
-      : `https://www.2embed.stream/embed/tv/${imdbId}/${season || 1}/${episode || 1}`;
-
-    const res = await safeFetch(pageUrl, {
-      headers: { 'User-Agent': UA_DESKTOP, Referer: 'https://www.2embed.stream/' },
-    });
-    if (!res.ok) return streams;
-    const html = await res.text();
-
-    // Procura por URLs M3U8 no JS inline
-    const patterns = [
-      /["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
-      /file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
-      /source\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
-    ];
-
-    const found = new Set();
-    for (const pat of patterns) {
-      let m;
-      while ((m = pat.exec(html)) !== null) {
-        if (!found.has(m[1])) {
-          found.add(m[1]);
-          streams.push({
-            url        : proxyM3U8(m[1], pageUrl),
-            name       : '📡 2Embed',
-            description: '2Embed.stream • HLS',
-            behaviorHints: { notWebReady: false },
-          });
-        }
-      }
-    }
-
-    // MP4 como fallback
-    if (!streams.length) {
-      const mp4 = html.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)/i);
-      if (mp4) {
-        streams.push({
-          url        : mp4[1],
-          name       : '📡 2Embed',
-          description: '2Embed.stream • MP4',
-          behaviorHints: { notWebReady: false },
-        });
-      }
-    }
-  } catch (e) {
-    console.warn('[2Embed] Erro:', e.message);
-  }
-  return streams;
+    const url = isMovie
+      ? `https://godriveplayer.com/player.php?imdb=${id}`
+      : `https://godriveplayer.com/player.php?imdb=${id}&season=${s}&episode=${e}`;
+    const res = await safeFetch(url, { headers: { 'User-Agent': UA, Referer: 'https://godriveplayer.com/' } });
+    if (!res.ok) return [];
+    return extractMedia(await res.text(), url).map(m => makeStream('☁️ GoDrive', 'GoDrivePlayer', m));
+  } catch (err) { console.warn('[GoDrive] Erro:', err.message); return []; }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// PROVEDOR 4: SuperFlixAPI (com Referer correto via proxy)
-// O "Acesso Restrito" acontece porque falta o Referer de um site parceiro.
-// Nosso proxy injeta o Referer correto (superflixapi.rest/doc) e extrai o stream.
-// ────────────────────────────────────────────────────────────────────────────
-async function extractSuperFlix(imdbId, type, season, episode) {
-  const streams = [];
-  try {
-    const isMovie = type === 'movie';
-    const SF_BASE = (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, '');
-
-    const pageUrl = isMovie
-      ? `${SF_BASE}/filme/${imdbId}`
-      : `${SF_BASE}/serie/${imdbId}/${season || 1}/${episode || 1}`;
-
-    // Injeta Referer de domínio parceiro — resolve o "Acesso Restrito"
-    const res = await safeFetch(pageUrl, {
-      headers: {
-        'User-Agent': UA_DESKTOP,
-        'Referer'   : `${SF_BASE}/doc`,          // Referer do próprio site = parceiro autorizado
-        'Origin'    : SF_BASE,
-        'Accept'    : 'text/html,*/*',
-      },
-    });
-
-    if (!res.ok) return streams;
-    const html = await res.text();
-
-    // Extrai M3U8 do JS inline do player
-    const m3u8Patterns = [
-      /["'](https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*)/gi,
-      /file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
-      /hls\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
-      /source\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/gi,
-    ];
-
-    const found = new Set();
-    for (const pat of m3u8Patterns) {
-      let m;
-      while ((m = pat.exec(html)) !== null) {
-        if (!found.has(m[1])) {
-          found.add(m[1]);
-          streams.push({
-            url        : proxyM3U8(m[1], pageUrl),
-            name       : '🇧🇷 SuperFlix BR',
-            description: `SuperFlixAPI • HLS${isMovie ? '' : ` S${season||1}E${episode||1}`}`,
-            behaviorHints: { notWebReady: false },
-          });
-        }
-      }
-    }
-
-    // Procura iframes aninhados (SF às vezes embeda outro player)
-    if (!streams.length) {
-      const iframeMatch = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-      if (iframeMatch && !iframeMatch[1].includes(SF_BASE)) {
-        // Tenta extrair do iframe aninhado
-        const nested = await extractFromIframe(iframeMatch[1], pageUrl);
-        streams.push(...nested.map(s => ({ ...s, name: `🇧🇷 SuperFlix BR` })));
-      }
-    }
-  } catch (e) {
-    console.warn('[SuperFlix] Erro:', e.message);
-  }
-  return streams;
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// PROVEDOR 5: GoDrivePlayer
-// Endpoint: https://godriveplayer.com/player.php?imdb={imdbId}
-// ────────────────────────────────────────────────────────────────────────────
-async function extractGoDrive(imdbId, type, season, episode) {
-  const streams = [];
-  try {
-    const isMovie = type === 'movie';
-    let pageUrl = `https://godriveplayer.com/player.php?imdb=${imdbId}`;
-    if (!isMovie) pageUrl += `&season=${season || 1}&episode=${episode || 1}`;
-
-    const res = await safeFetch(pageUrl, {
-      headers: { 'User-Agent': UA_DESKTOP, Referer: 'https://godriveplayer.com/' },
-    });
-    if (!res.ok) return streams;
-    const html = await res.text();
-
-    const m = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)/i);
-    if (m) {
-      streams.push({
-        url        : proxyM3U8(m[1], pageUrl),
-        name       : '☁️ GoDrive',
-        description: 'GoDrivePlayer • HLS',
-        behaviorHints: { notWebReady: false },
-      });
-    }
-  } catch (e) {
-    console.warn('[GoDrive] Erro:', e.message);
-  }
-  return streams;
-}
-
-// ── Extrator genérico de iframes aninhados ────────────────────────────────────
-async function extractFromIframe(iframeSrc, referer) {
-  const streams = [];
-  try {
-    const fullSrc = iframeSrc.startsWith('//') ? 'https:' + iframeSrc : iframeSrc;
-    const res = await safeFetch(fullSrc, {
-      headers: { 'User-Agent': UA_DESKTOP, Referer: referer },
-      redirect: 'follow',
-    });
-    if (!res.ok) return streams;
-    const html = await res.text();
-
-    const m3u8 = html.match(/["'](https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*)/i);
-    if (m3u8) {
-      streams.push({
-        url        : proxyM3U8(m3u8[1], fullSrc),
-        name       : 'HLS',
-        description: 'HLS',
-        behaviorHints: { notWebReady: false },
-      });
-    }
-    const mp4 = !m3u8 && html.match(/["'](https?:\/\/[^"'<>\s]+\.mp4[^"'<>\s]*)/i);
-    if (mp4) {
-      streams.push({ url: mp4[1], name: 'MP4', description: 'MP4', behaviorHints: { notWebReady: false } });
-    }
-  } catch (_) {}
-  return streams;
-}
-
-// ── Função principal: agrega todos os provedores em paralelo ──────────────────
-
-/**
- * Busca streams de todos os provedores em paralelo.
- * Retorna os primeiros resultados válidos de cada provedor.
- * @param {string} imdbId  — ex: "tt0816692"
- * @param {'movie'|'series'} type
- * @param {number|null} season
- * @param {number|null} episode
- */
+// ── Função principal ──────────────────────────────────────────────────────────
 async function getAllStreams(imdbId, type, season, episode) {
-  const stremioType = type === 'movie' ? 'movie' : 'series';
+  // CORREÇÃO PRINCIPAL: isMovie é determinado pelo type, não pela presença de season
+  const isMovie = (type === 'movie');
 
-  console.log(`[Providers] Buscando streams: ${imdbId} (${stremioType}) S${season}E${episode}`);
+  // Para séries: garantir que season e episode nunca sejam null/undefined
+  const s = isMovie ? null : (typeof season  === 'number' && season  > 0 ? season  : 1);
+  const e = isMovie ? null : (typeof episode === 'number' && episode > 0 ? episode : 1);
+
+  console.log(`[Providers] ${imdbId} | ${type} | ${isMovie ? 'Filme' : `S${s}E${e}`}`);
 
   const results = await Promise.allSettled([
-    extractSuperFlix(imdbId, stremioType, season, episode),
-    extractVidSrc(imdbId, stremioType, season, episode),
-    extractAutoEmbed(imdbId, stremioType, season, episode),
-    extract2Embed(imdbId, stremioType, season, episode),
-    extractGoDrive(imdbId, stremioType, season, episode),
+    extractSuperFlix(imdbId, isMovie, s, e),
+    extractVidSrc(imdbId, isMovie, s, e),
+    extractVidSrcMe(imdbId, isMovie, s, e),
+    extractAutoEmbed(imdbId, isMovie, s, e),
+    extract2Embed(imdbId, isMovie, s, e),
+    extractMultiEmbed(imdbId, isMovie, s, e),
+    extractGoDrive(imdbId, isMovie, s, e),
   ]);
 
-  const allStreams = [];
+  const all = [];
   for (const r of results) {
-    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
-      allStreams.push(...r.value);
-    }
+    if (r.status === 'fulfilled') all.push(...(r.value || []));
   }
-
-  console.log(`[Providers] Total de streams encontradas: ${allStreams.length}`);
-  return allStreams;
+  console.log(`[Providers] Streams encontradas: ${all.length}`);
+  return all;
 }
 
 module.exports = { getAllStreams };
