@@ -1,31 +1,10 @@
 'use strict';
 
-/**
- * addon.js — v10.0.0
- *
- * PROBLEMA 1 CORRIGIDO: AniTube não aparece em Cinemeta/Kitsu.
- *   O Stremio só chama o streamHandler de um addon se o ID do conteúdo
- *   começar com um dos prefixos declarados em idPrefixes.
- *   Cinemeta usa IDs "tt..." → já estava declarado ✅
- *   Kitsu usa IDs "kitsu:..." → já estava declarado ✅
- *   O REAL PROBLEMA: a busca AniTube só funciona via catálogos do próprio addon.
- *   Para aparecer ao pesquisar em Cinemeta/Kitsu, o addon precisa expor
- *   catálogos do tipo "series" com suporte a search — o que já existe.
- *   O que faltava: o catálogo anitube_search não tinha um fallback para
- *   retornar resultados quando o Stremio faz uma busca via "extra.search".
- *   AGORA: catálogos AniTube com search funcionam corretamente.
- *
- * PROBLEMA 2 CORRIGIDO: buildSFStreams removido (gerava externalUrl).
- *   Streams vêm 100% de getAllStreams (providers.js) — player interno Stremio.
- *
- * PROBLEMA 3 CORRIGIDO: SuperFlix catálogos agora usam scraping HTML correto.
- */
-
 const { addonBuilder } = require('stremio-addon-sdk');
 const scraper  = require('./src/scraper');
 const { extractStreams } = require('./src/extractor');
 const sf       = require('./src/superflixapi');
-const { getAllStreams } = require('./src/providers');
+const { getAllStreams, extractSuperFlix } = require('./src/providers');
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 const cache   = new Map();
@@ -51,80 +30,38 @@ const manifest = {
   types      : ['series', 'movie'],
 
   // idPrefixes garante que streamHandler é chamado para IDs externos:
-  //   'tt'     → Cinemeta (filmes e séries IMDB)
-  //   'kitsu:' → Kitsu (animes)
-  //   'anitube:'→ catálogos próprios
-  idPrefixes : ['anitube:', 'tt', 'kitsu:'],
+  idPrefixes : ['anitube:', 'tt', 'kitsu:', 'sf:'],
 
   behaviorHints: { configurable: false, adult: false },
 
   catalogs: [
-    // ── AniTube ──
-    // Todos com "search" habilitado → aparecem nos resultados de busca global do Stremio
+    // AniTube...
     {
       id   : 'anitube_ultimos_eps',
       type : 'series',
       name : '🆕 AniTube – Últimos Episódios',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
+      extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }],
     },
-    {
-      id   : 'anitube_mais_vistos',
-      type : 'series',
-      name : '🔥 AniTube – Mais Vistos',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
-    },
-    {
-      id   : 'anitube_recentes',
-      type : 'series',
-      name : '📺 AniTube – Animes Recentes',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
-    },
-    {
-      id   : 'anitube_lista',
-      type : 'series',
-      name : '📚 AniTube – Lista Completa',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
-    },
+    // ... demais AniTube
 
-    // ── SuperFlix BR ──
+    // SuperFlix BR
     {
       id   : 'sf_filmes',
       type : 'movie',
       name : '🎬 SuperFlix BR – Filmes',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
+      extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }],
     },
     {
       id   : 'sf_series',
       type : 'series',
       name : '📺 SuperFlix BR – Séries',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
+      extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }],
     },
     {
       id   : 'sf_animes',
       type : 'series',
       name : '🎌 SuperFlix BR – Animes (Dub/Leg)',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
+      extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }],
     },
     {
       id   : 'sf_lancamentos',
@@ -152,12 +89,9 @@ builder.defineCatalogHandler(async function(args) {
   try {
     let metas = [];
 
-    // ── AniTube ──
     if (id.startsWith('anitube_')) {
-      if (search) {
-        // Busca no AniTube — funciona ao pesquisar de qualquer catálogo
-        metas = await scraper.searchAnimes(search);
-      } else {
+      if (search) metas = await scraper.searchAnimes(search);
+      else {
         switch (id) {
           case 'anitube_ultimos_eps': metas = await scraper.getLatestEpisodes(page); break;
           case 'anitube_mais_vistos': metas = await scraper.getMostWatched(page);    break;
@@ -166,10 +100,7 @@ builder.defineCatalogHandler(async function(args) {
           default:                    metas = await scraper.getAnimeList(page);      break;
         }
       }
-    }
-
-    // ── SuperFlix BR ──
-    else if (id.startsWith('sf_')) {
+    } else if (id.startsWith('sf_')) {
       if (search) {
         const sfType = id === 'sf_filmes' ? 'movie' : 'series';
         metas = await sf.searchContent(search, sfType);
@@ -207,8 +138,25 @@ builder.defineMetaHandler(async function(args) {
 
     if (id.startsWith('anitube:')) {
       result = await scraper.getAnimeMeta(id.replace('anitube:', ''));
+    } else if (id.startsWith('sf:')) {
+      // tenta enriquecer via SF helper (pode retornar imdb-based meta se possível)
+      const sfMeta = await sf.getSFMeta(id, type);
+      if (!sfMeta) return { meta: {} };
+      // se sfMeta.id for tt... usamos como id para Stremio; caso contrário mantemos sf:
+      result = {
+        meta: {
+          id: sfMeta.id || id,
+          type: type === 'movie' ? 'movie' : 'series',
+          name: sfMeta.name || '',
+          poster: sfMeta.poster || '',
+          background: sfMeta.background || sfMeta.poster || '',
+          description: sfMeta.description || '',
+          genres: sfMeta.genres || [],
+          year: sfMeta.year || undefined,
+        },
+      };
     } else if (id.startsWith('tt')) {
-      const data = await sf.fetchMeta(id, type);
+      const data = await sf.fetchMetaByImdb ? await sf.fetchMetaByImdb(id, type) : await sf.getSFMeta('sf:' + id, type);
       if (!data) return { meta: {} };
       result = {
         meta: {
@@ -246,42 +194,39 @@ builder.defineStreamHandler(async function(args) {
   try {
     let streams = [];
 
-    // ── 1. AniTube nativo (IDs anitube:XXXXX) ────────────────────────────────
     if (id.startsWith('anitube:')) {
       const epId = id.replace('anitube:', '');
       const sr   = await scraper.getEpisodeIframes(epId);
       if (sr && sr.sources && sr.sources.length) {
         streams = await extractStreams(sr.sources, sr.episodeUrl);
       }
-    }
-
-    // ── 2. IDs IMDB — Cinemeta, SuperFlix catálogos ───────────────────────────
-    else if (id.startsWith('tt')) {
+    } else if (id.startsWith('sf:')) {
+      // ID sf:<originalId> -> tenta extrair streams diretamente do SuperFlix (bypass)
+      const sfId = id.replace('sf:', '');
+      const isMovie = (type === 'movie');
+      const s = isMovie ? null : 1;
+      const e = isMovie ? null : 1;
+      // extractSuperFlix aceita tanto tt... quanto numéricos
+      streams = await extractSuperFlix(sfId, isMovie, s, e);
+    } else if (id.startsWith('tt')) {
       const parts   = id.split(':');
       const imdbId  = parts[0];
       const season  = parts[1] !== undefined ? parseInt(parts[1], 10) : null;
       const episode = parts[2] !== undefined ? parseInt(parts[2], 10) : null;
       const isMovie = (type === 'movie');
 
-      // Extrai streams reais (M3U8/MP4) de todos os provedores em paralelo
       streams = await getAllStreams(imdbId, type, season, episode);
 
-      // Fallback: AniTube (especialmente útil para animes)
       if (!isMovie && streams.length < 2) {
         const atStreams = await tryAniTube(imdbId, type, season, episode);
         streams.push.apply(streams, atStreams);
       }
-    }
-
-    // ── 3. IDs Kitsu (kitsu:12345:season:episode) ─────────────────────────────
-    // O Stremio/Kitsu addon envia IDs no formato "kitsu:12345:1:3"
-    else if (id.startsWith('kitsu:')) {
+    } else if (id.startsWith('kitsu:')) {
       const parts   = id.split(':');
-      const kitsuId = parts[0] + ':' + parts[1]; // "kitsu:12345"
+      const kitsuId = parts[0] + ':' + parts[1];
       const season  = parts[2] ? parseInt(parts[2], 10) : 1;
       const episode = parts[3] ? parseInt(parts[3], 10) : 1;
 
-      // Busca título via Kitsu API
       const atStreams = await tryAniTubeKitsu(kitsuId, season, episode);
       streams.push.apply(streams, atStreams);
     }
@@ -296,8 +241,7 @@ builder.defineStreamHandler(async function(args) {
   }
 });
 
-// ── Helpers de fallback AniTube ───────────────────────────────────────────────
-
+// ── Helpers AniTube (mantidos) ───────────────────────────────────────────────
 async function tryAniTube(imdbId, type, season, episode) {
   try {
     const fetch   = require('node-fetch');
@@ -336,7 +280,6 @@ async function tryAniTubeKitsu(kitsuId, season, episode) {
 }
 
 async function searchAndExtractAniTube(title, aliases, season, episode) {
-  // Tenta variações do nome para aumentar chance de match no AniTube
   const queries = new Set();
   queries.add(title.replace(/\(Dub\)/i, '').split(':')[0].split(' - ')[0].trim());
   queries.add(title.replace(/\(Dub\)/i, '').trim());
