@@ -1,7 +1,7 @@
 {
-  "name": "stremio-anitube",
-  "version": "2.0.0",
-  "description": "Stremio Addon para AniTube.news – animes em português",
+  "name": "stremio-anitube-redecanais",
+  "version": "4.0.0",
+  "description": "Stremio Addon combinado: AniTube.news + RedeCanais",
   "main": "addon.js",
   "scripts": {
     "start": "node server.js",
