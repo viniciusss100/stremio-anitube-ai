@@ -1,366 +1,218 @@
 'use strict';
 
 /**
- * SuperFlixAPI — Integração v1.0.0
+ * superflixapi.js — v3.0.0
  *
- * A SuperFlixAPI é uma API brasileira pública que fornece players embed
- * para filmes, séries, animes e doramas via ID IMDB ou TMDB.
+ * PROBLEMA 1 CORRIGIDO: Catálogos SF vazios.
+ *   O endpoint /lista?category=...&format=json NAO EXISTE MAIS.
+ *   Endpoints reais: /filmes /series /animes (HTML com links)
+ *   Scrapar os IDs IMDB/TMDB do HTML e enriquecer via Cinemeta.
  *
- * Endpoints documentados (superflixapi.run):
- * Player filme  : /filme/{imdb_ou_tmdb}
- * Player série  : /serie/{imdb_ou_tmdb}/{temporada}/{episodio}
- * Lista IDs     : /lista?category=movie|serie|anime&type=imdb|tmdb&format=json
- * Calendário    : /calendario.php  (episódios recentes/futuros)
- *
- * Vantagens sobre scraping:
- * ✅ Sem Cloudflare / sem 403
- * ✅ Aceita IDs IMDB nativamente (compatível com Cinemeta)
- * ✅ Catálogo com lista de IDs disponíveis
- * ✅ Domínio estável
- * ✅ Sem necessidade de proxy (streams são diretos)
+ * PROBLEMA 2 CORRIGIDO: buildSFStreams removido daqui (era quem gerava externalUrl).
+ *   Streams agora vêm 100% de providers.js (extração real M3U8/MP4).
  */
 
-const fetch = require('node-fetch');
+const fetch   = require('node-fetch');
+const cheerio = require('cheerio');
 
-// ── Configuração ──────────────────────────────────────────────────────────────
-// superflixapi.rest e superflixapi.run são espelhos — .run tem melhor uptime
-const SF_BASE    = (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, '');
-const TMDB_KEY   = process.env.TMDB_API_KEY || ''; // Opcional — melhora metadados
+const SF_BASE  = (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, '');
+const TMDB_KEY = process.env.TMDB_API_KEY || '';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-           '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-const PORT       = parseInt(process.env.PORT || '7000', 10);
-const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
-
-// ── Cache de lista de IDs (pesada, renovada a cada 2h) ───────────────────────
-let _listCache   = {};
-let _listCacheTs = {};
-const LIST_TTL   = 2 * 60 * 60 * 1000; // 2 horas
-
-// ── HTTP helper ───────────────────────────────────────────────────────────────
-async function safeFetch(url, opts = {}, timeout = 12000) {
+async function safeFetch(url, opts, timeout) {
+  opts    = opts    || {};
+  timeout = timeout || 15000;
   const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeout);
+  const timer = setTimeout(function() { ctrl.abort(); }, timeout);
   try {
-    return await fetch(url, {
-      ...opts,
-      headers: { 'User-Agent': UA, Accept: 'application/json,text/html,*/*', ...(opts.headers || {}) },
-      signal: ctrl.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+    return await fetch(url, Object.assign({}, opts, {
+      headers: Object.assign({ 'User-Agent': UA, Accept: '*/*' }, opts.headers || {}),
+      signal : ctrl.signal,
+    }));
+  } finally { clearTimeout(timer); }
 }
 
-// ── Lista de IDs disponíveis na SuperFlixAPI ─────────────────────────────────
-async function fetchIdList(category) {
-  const now = Date.now();
-  if (_listCache[category] && now - _listCacheTs[category] < LIST_TTL) {
-    return _listCache[category];
-  }
-
-  try {
-    const url = `${SF_BASE}/lista?category=${category}&type=imdb&format=json&order=desc`;
-    const res = await safeFetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    const text = await res.text();
-    let ids = [];
-
-    try {
-      const json = JSON.parse(text);
-      if (Array.isArray(json)) {
-        ids = json.map(item => {
-          if (typeof item === 'string') return item.trim();
-          return item.imdb || item.id || item.imdb_id || '';
-        }).filter(Boolean);
-      } else if (json.data) {
-        ids = Array.isArray(json.data) ? json.data : [];
-      }
-    } catch (_) {
-      ids = text.split(/[\n,\s]+/).map(s => s.trim()).filter(s => s.startsWith('tt'));
-    }
-
-    console.log(`[SF] Lista "${category}": ${ids.length} IDs carregados`);
-    _listCache[category]   = ids;
-    _listCacheTs[category] = now;
-    return ids;
-  } catch (e) {
-    console.warn(`[SF] Falha ao buscar lista "${category}":`, e.message);
-    return _listCache[category] || [];
-  }
-}
-
-// ── Calendário (episódios recentes) ──────────────────────────────────────────
-let _calCache   = null;
-let _calCacheTs = 0;
-const CAL_TTL   = 30 * 60 * 1000; // 30 min
-
-async function fetchCalendar() {
-  const now = Date.now();
-  if (_calCache && now - _calCacheTs < CAL_TTL) return _calCache;
-
-  try {
-    const res = await safeFetch(`${SF_BASE}/calendario.php`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    _calCache   = Array.isArray(json) ? json : (json.data || json.episodes || []);
-    _calCacheTs = now;
-    return _calCache;
-  } catch (e) {
-    console.warn('[SF] Falha ao buscar calendário:', e.message);
-    return _calCache || [];
-  }
-}
-
-// ── Metadados via TMDB (enriquece catálogos com poster/nome) ─────────────────
-const _tmdbCache = new Map();
-const TMDB_TTL   = 24 * 60 * 60 * 1000; // 24h
+// ── Cache de metadata Cinemeta ────────────────────────────────────────────────
+const _metaCache = new Map();
+const META_TTL   = 24 * 3600 * 1000;
 
 async function fetchMeta(imdbId, type) {
-  const key    = `${imdbId}:${type}`;
-  const cached = _tmdbCache.get(key);
-  if (cached && Date.now() - cached.ts < TMDB_TTL) return cached.value;
+  const key    = imdbId + ':' + type;
+  const cached = _metaCache.get(key);
+  if (cached && Date.now() - cached.ts < META_TTL) return cached.value;
+
+  let meta = null;
+
+  if (TMDB_KEY) {
+    try {
+      const r = await safeFetch(
+        'https://api.themoviedb.org/3/find/' + imdbId + '?external_source=imdb_id&language=pt-BR',
+        { headers: { Authorization: 'Bearer ' + TMDB_KEY } }
+      );
+      if (r.ok) {
+        const j    = await r.json();
+        const item = (j.movie_results || [])[0] || (j.tv_results || [])[0];
+        if (item) meta = {
+          name: item.title || item.name || '',
+          poster: item.poster_path ? 'https://image.tmdb.org/t/p/w500' + item.poster_path : '',
+          background: item.backdrop_path ? 'https://image.tmdb.org/t/p/w1280' + item.backdrop_path : '',
+          description: item.overview || '',
+          year: (item.release_date || item.first_air_date || '').split('-')[0],
+          genres: [],
+        };
+      }
+    } catch (_) {}
+  }
+
+  if (!meta) {
+    try {
+      const cinType = type === 'movie' ? 'movie' : 'series';
+      const r = await safeFetch('https://v3-cinemeta.strem.io/meta/' + cinType + '/' + imdbId + '.json');
+      if (r.ok) {
+        const j = await r.json();
+        const m = j && j.meta;
+        if (m && m.name) meta = {
+          name: m.name || '', poster: m.poster || '',
+          background: m.background || m.poster || '',
+          description: m.description || '',
+          year: m.year ? String(m.year) : '',
+          genres: m.genres || [],
+        };
+      }
+    } catch (_) {}
+  }
+
+  if (meta) _metaCache.set(key, { value: meta, ts: Date.now() });
+  return meta;
+}
+
+// ── Scraping das páginas de listagem SF ──────────────────────────────────────
+const _listCache = {}, _listTs = {};
+const LIST_TTL   = 3600 * 1000; // 1h
+
+async function scrapeSFList(endpoint) {
+  const now = Date.now();
+  if (_listCache[endpoint] && now - _listTs[endpoint] < LIST_TTL) return _listCache[endpoint];
 
   try {
-    let meta = null;
+    const r = await safeFetch(SF_BASE + endpoint, { headers: { Referer: SF_BASE + '/' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const $ = cheerio.load(await r.text());
 
-    if (TMDB_KEY) {
-      const endpoint = type === 'movie'
-        ? `https://api.themoviedb.org/3/find/${imdbId}?external_source=imdb_id&language=pt-BR`
-        : `https://api.themoviedb.org/3/find/${imdbId}?external_source=imdb_id&language=pt-BR`;
+    const ids = [], seen = new Set();
+    $('a[href]').each(function(_, el) {
+      const href = $(el).attr('href') || '';
+      const m    = href.match(/\/(filme|serie|anime|dorama)\/((tt\d+|\d{5,}))/);
+      if (!m) return;
+      const id = m[2];
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    });
 
-      const res = await safeFetch(
-        endpoint,
-        { headers: { Authorization: `Bearer ${TMDB_KEY}` } }
-      );
-      if (res.ok) {
-        const j    = await res.json();
-        const item = (j.movie_results?.[0]) || (j.tv_results?.[0]);
-        if (item) {
-          meta = {
-            name       : item.title || item.name || '',
-            poster     : item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '',
-            background : item.backdrop_path ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}` : '',
-            description: item.overview || '',
-            year       : (item.release_date || item.first_air_date || '').split('-')[0],
-          };
-        }
-      }
-    }
-
-    if (!meta) {
-      const cinType = type === 'movie' ? 'movie' : 'series';
-      const res     = await safeFetch(`https://v3-cinemeta.strem.io/meta/${cinType}/${imdbId}.json`);
-      if (res.ok) {
-        const j = await res.json();
-        const m = j?.meta;
-        if (m) {
-          meta = {
-            name       : m.name || m.title || '',
-            poster     : m.poster || '',
-            background : m.background || m.poster || '',
-            description: m.description || '',
-            year       : m.year || '',
-            genres     : m.genres || [],
-          };
-        }
-      }
-    }
-
-    if (meta) {
-      _tmdbCache.set(key, { value: meta, ts: Date.now() });
-    }
-    return meta;
-
+    console.log('[SF] Scraped ' + ids.length + ' IDs de ' + endpoint);
+    _listCache[endpoint] = ids;
+    _listTs[endpoint]    = now;
+    return ids;
   } catch (e) {
-    console.warn(`[SF] Falha ao buscar meta para ${imdbId}:`, e.message);
-    return null;
+    console.warn('[SF] Falha ' + endpoint + ':', e.message);
+    return _listCache[endpoint] || [];
   }
 }
 
-// ── Construir metas para catálogo Stremio ────────────────────────────────────
-async function buildMetas(imdbIds, type, page = 1, pageSize = 20) {
-  const start   = (page - 1) * pageSize;
-  const pageIds = imdbIds.slice(start, start + pageSize);
+async function buildMetas(ids, stremioType, page) {
+  page = page || 1;
+  const SIZE  = 20;
+  const slice = ids.slice((page - 1) * SIZE, page * SIZE);
+  const type  = stremioType === 'movie' ? 'movie' : 'series';
 
-  const stremioType = type === 'movie' ? 'movie' : 'series';
+  const out = await Promise.allSettled(slice.map(async function(id) {
+    // IDs numéricos (TMDB) sem chave: tenta endpoint externo com IMDB
+    let imdbId = id;
+    if (!id.startsWith('tt') && TMDB_KEY) {
+      try {
+        const ep = type === 'movie'
+          ? 'https://api.themoviedb.org/3/movie/' + id + '?language=pt-BR'
+          : 'https://api.themoviedb.org/3/tv/'    + id + '?language=pt-BR';
+        const r = await safeFetch(ep, { headers: { Authorization: 'Bearer ' + TMDB_KEY } });
+        if (r.ok) { const j = await r.json(); if (j.imdb_id) imdbId = j.imdb_id; }
+      } catch (_) {}
+    }
+    if (!imdbId.startsWith('tt')) return null;
+    const meta = await fetchMeta(imdbId, type);
+    if (!meta || !meta.name) return null;
+    return { id: imdbId, type: stremioType, name: meta.name, poster: meta.poster || '', posterShape: 'poster', year: meta.year || undefined };
+  }));
 
-  const results = await Promise.allSettled(
-    pageIds.map(async imdbId => {
-      const meta = await fetchMeta(imdbId, type);
-      if (!meta || !meta.name) {
-        return {
-          id        : imdbId,
-          type      : stremioType,
-          name      : imdbId,
-          poster    : '',
-          posterShape: 'poster',
-        };
-      }
-      return {
-        id         : imdbId,
-        type       : stremioType,
-        name       : meta.name,
-        poster     : meta.poster || '',
-        posterShape: 'poster',
-        year       : meta.year,
-      };
-    })
-  );
-
-  return results
-    .filter(r => r.status === 'fulfilled')
-    .map(r => r.value)
-    .filter(m => m.name && m.name !== m.id);
+  return out.filter(function(r) { return r.status === 'fulfilled' && r.value; }).map(function(r) { return r.value; });
 }
 
-// ── Funções de catálogo ───────────────────────────────────────────────────────
-async function getMovies(page = 1) {
-  const ids = await fetchIdList('movie');
-  return buildMetas(ids, 'movie', page);
-}
+async function getMovies(page)  { return buildMetas(await scrapeSFList('/filmes'), 'movie',  page); }
+async function getSeries(page)  { return buildMetas(await scrapeSFList('/series'), 'series', page); }
+async function getAnimes(page)  { return buildMetas(await scrapeSFList('/animes'), 'series', page); }
 
-async function getSeries(page = 1) {
-  const ids = await fetchIdList('serie');
-  return buildMetas(ids, 'series', page);
-}
-
-async function getAnimes(page = 1) {
-  const ids = await fetchIdList('anime');
-  return buildMetas(ids, 'series', page);
-}
+// ── Calendário ────────────────────────────────────────────────────────────────
+let _cal = null, _calTs = 0;
+const CAL_TTL = 30 * 60 * 1000;
 
 async function getRecentEpisodes() {
-  const calendar = await fetchCalendar();
+  const now = Date.now();
+  if (_cal && now - _calTs < CAL_TTL) return _cal;
+  try {
+    const r = await safeFetch(SF_BASE + '/calendario.php', { headers: { Referer: SF_BASE + '/' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const list = await r.json();
+    const arr  = Array.isArray(list) ? list : (list.data || list.episodes || []);
+    const seen = new Set(), out = [];
+    for (const ep of arr) {
+      const id = ep.imdb_id || ep.imdb || ep.id || '';
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, type: 'series', name: ep.title || ep.name || id, poster: ep.poster || ep.image || '', posterShape: 'poster' });
+      if (out.length >= 20) break;
+    }
+    _cal = out; _calTs = now;
+    return out;
+  } catch (e) { console.warn('[SF/Cal]', e.message); return _cal || []; }
+}
 
-  const seen    = new Set();
-  const results = [];
+// ── Busca ─────────────────────────────────────────────────────────────────────
+async function searchContent(query, type) {
+  if (!query || !query.trim()) return [];
+  const q = encodeURIComponent(query.trim());
+  const sfType  = type === 'movie' ? 'movie' : 'series';
+  const cinType = type === 'movie' ? 'movie' : 'series';
+  let results = [];
 
-  for (const ep of calendar) {
-    const imdbId = ep.imdb_id || ep.imdb || ep.id;
-    if (!imdbId || seen.has(imdbId)) continue;
-    seen.add(imdbId);
+  if (TMDB_KEY) {
+    try {
+      const ep = sfType === 'movie'
+        ? 'https://api.themoviedb.org/3/search/movie?query=' + q + '&language=pt-BR'
+        : 'https://api.themoviedb.org/3/search/tv?query='    + q + '&language=pt-BR';
+      const r = await safeFetch(ep, { headers: { Authorization: 'Bearer ' + TMDB_KEY } });
+      if (r.ok) {
+        const j = await r.json();
+        results = (j.results || []).slice(0, 15).map(function(i) {
+          return { id: i.imdb_id || ('tmdb:' + i.id), type: sfType, name: i.title || i.name || '', poster: i.poster_path ? 'https://image.tmdb.org/t/p/w500' + i.poster_path : '', posterShape: 'poster' };
+        }).filter(function(m) { return m.name; });
+      }
+    } catch (_) {}
+  }
 
-    results.push({
-      id         : imdbId,
-      type       : 'series',
-      name       : ep.title || ep.name || imdbId,
-      poster     : ep.poster || ep.image || '',
-      posterShape: 'poster',
-      description: ep.overview || '',
-    });
-
-    if (results.length >= 20) break;
+  if (!results.length) {
+    try {
+      const r = await safeFetch('https://v3-cinemeta.strem.io/catalog/' + cinType + '/top/search=' + q + '.json');
+      if (r.ok) {
+        const j = await r.json();
+        results = (j.metas || []).slice(0, 15).map(function(m) {
+          return { id: m.id, type: sfType, name: m.name || m.title || '', poster: m.poster || '', posterShape: 'poster' };
+        }).filter(function(m) { return m.id && m.name; });
+      }
+    } catch (_) {}
   }
 
   return results;
 }
 
-async function searchContent(query, type) {
-  if (!query?.trim()) return [];
-
-  try {
-    const q = encodeURIComponent(query.trim());
-    let results = [];
-
-    if (TMDB_KEY) {
-      const endpoint = type === 'movie'
-        ? `https://api.themoviedb.org/3/search/movie?query=${q}&language=pt-BR`
-        : `https://api.themoviedb.org/3/search/tv?query=${q}&language=pt-BR`;
-
-      const res = await safeFetch(endpoint, { headers: { Authorization: `Bearer ${TMDB_KEY}` } });
-      if (res.ok) {
-        const j     = await res.json();
-        const items = j.results || [];
-        results = items.slice(0, 10).map(item => ({
-          tmdbId : item.id?.toString(),
-          name   : item.title || item.name || '',
-          poster : item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : '',
-          year   : (item.release_date || item.first_air_date || '').split('-')[0],
-        }));
-      }
-    }
-
-    if (!results.length) {
-      const cinType = type === 'movie' ? 'movie' : 'series';
-      const res     = await safeFetch(
-        `https://v3-cinemeta.strem.io/catalog/${cinType}/top/search=${q}.json`
-      );
-      if (res.ok) {
-        const j = await res.json();
-        results = (j.metas || []).slice(0, 10).map(m => ({
-          imdbId : m.id,
-          name   : m.name || m.title || '',
-          poster : m.poster || '',
-          year   : m.year || '',
-        }));
-      }
-    }
-
-    const stremioType = type === 'movie' ? 'movie' : 'series';
-    return results.map(r => ({
-      id         : r.imdbId || r.tmdbId || '',
-      type       : stremioType,
-      name       : r.name,
-      poster     : r.poster,
-      posterShape: 'poster',
-      year       : r.year,
-    })).filter(m => m.id && m.name);
-
-  } catch (e) {
-    console.warn('[SF] Erro na busca:', e.message);
-    return [];
-  }
-}
-
-// ── Geração de streams ────────────────────────────────────────────────────────
-function buildSFStreams(imdbId, type, season, episode) {
-  const streams = [];
-  const isMovie = type === 'movie';
-
-  const endpoints = [
-    { label: 'SuperFlixAPI',        base: 'https://superflixapi.run'  },
-    { label: 'SuperFlixAPI Mirror', base: 'https://superflixapi.rest' },
-  ];
-
-  for (const { label, base } of endpoints) {
-    let sfUrl;
-    if (isMovie) {
-      sfUrl = `${base}/filme/${imdbId}`;
-    } else {
-      const s = season  || 1;
-      const e = episode || 1;
-      sfUrl = `${base}/serie/${imdbId}/${s}/${e}`;
-    }
-
-    // Passa a URL do SuperFlix pelo player local para forçar o iframe e liberar o acesso
-    const proxyPlayerUrl = `${PUBLIC_URL}/player?url=${encodeURIComponent(sfUrl)}`;
-
-    streams.push({
-      externalUrl: proxyPlayerUrl,
-      name       : `📺 ${label}`,
-      description: isMovie
-        ? '🇧🇷 Dublado/Legendado • Abre no Navegador'
-        : `🇧🇷 S${season || 1}E${episode || 1} • Abre no Navegador`,
-      behaviorHints: {
-        notWebReady: false,
-      },
-    });
-  }
-
-  return streams;
-}
-
-// ── Export ────────────────────────────────────────────────────────────────────
-module.exports = {
-  getMovies,
-  getSeries,
-  getAnimes,
-  getRecentEpisodes,
-  searchContent,
-  buildSFStreams,
-  fetchMeta,
-  SF_BASE: () => SF_BASE,
-};
+module.exports = { getMovies, getSeries, getAnimes, getRecentEpisodes, searchContent, fetchMeta };
