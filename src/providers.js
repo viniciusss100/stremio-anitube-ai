@@ -3,10 +3,10 @@
 /**
  * providers.js — v3.0.0
  * CORREÇÕES:
- *  - Bug "SnullEnull" corrigido: isMovie agora depende de type==='movie', não de season===null
- *  - season/episode sempre têm fallback para 1 quando série
- *  - Domínios atualizados: autoembed.cc (sem player.), vidsrc.me adicionado
- *  - Novo provedor: multiembed.mov (SuperEmbed VIP)
+ * - Bug "SnullEnull" corrigido: isMovie agora depende de type==='movie', não de season===null
+ * - season/episode sempre têm fallback para 1 quando série
+ * - Domínios atualizados: autoembed.cc (sem player.), vidsrc.me adicionado
+ * - Novo provedor: multiembed.mov (SuperEmbed VIP)
  */
 
 const fetch = require('node-fetch');
@@ -179,10 +179,10 @@ async function getAllStreams(imdbId, type, season, episode) {
   console.log(`[Providers] ${imdbId} | ${type} | ${isMovie ? 'Filme' : `S${s}E${e}`}`);
 
   const results = await Promise.allSettled([
-    extractSuperFlix(imdbId, isMovie, s, e),
+    // extractSuperFlix(imdbId, isMovie, s, e), // Removido pois usamos o buildSFStreams no addon.js
     extractVidSrc(imdbId, isMovie, s, e),
     extractVidSrcMe(imdbId, isMovie, s, e),
-    extractAutoEmbed(imdbId, isMovie, s, e),
+    // extractAutoEmbed(imdbId, isMovie, s, e), // Removido pois o domínio está fora do ar (ENOTFOUND)
     extract2Embed(imdbId, isMovie, s, e),
     extractMultiEmbed(imdbId, isMovie, s, e),
     extractGoDrive(imdbId, isMovie, s, e),
@@ -192,7 +192,7 @@ async function getAllStreams(imdbId, type, season, episode) {
   for (const r of results) {
     if (r.status === 'fulfilled') all.push(...(r.value || []));
   }
-  console.log(`[Providers] Streams encontradas: ${all.length}`);
+  console.log(`[Providers] Streams encontradas via raspagem (fallback): ${all.length}`);
   return all;
 }
 
