@@ -2,7 +2,7 @@
 
 /**
  * ══════════════════════════════════════════════════════════════════
- * Stremio Addon – AniTube.news  v3.3.0 + Bypass SuperFlix
+ * Stremio Addon – AniTube + SuperFlix BR  v8.0.0 + Bypass SuperFlix
  * CORREÇÕES:
  * - Proxy HLS agora lida com Master Playlist (multi-qualidade)
  * - Sub-playlists (.m3u8 aninhadas) também são proxiadas
@@ -156,31 +156,6 @@ app.get('/proxy/segment', async (req, res) => {
   }
 });
 
-// ───────────────────────────────────────────────────────────────────────────
-// PLAYER EMBED (Bypass de Proteção do SuperFlix)
-// ───────────────────────────────────────────────────────────────────────────
-app.get('/player', (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('URL faltante');
-
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="pt-BR">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>SuperFlix Player</title>
-      <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
-        iframe { width: 100%; height: 100%; border: none; }
-      </style>
-    </head>
-    <body>
-      <iframe src="${url}" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>
-    </body>
-    </html>
-  `);
-});
 
 // ───────────────────────────────────────────────────────────────────────────
 // STREMIO ADDON SDK
@@ -191,7 +166,7 @@ app.use(addonRouter);
 app.listen(PORT, () => {
   console.log('');
   console.log('╔══════════════════════════════════════════════════╗');
-  console.log('║       Stremio Addon – AniTube.news  v3.3.0       ║');
+  console.log('║       Stremio Addon – AniTube + SuperFlix BR  v8.0.0       ║');
   console.log('╠══════════════════════════════════════════════════╣');
   console.log('║  ✅  Servidor rodando com PROXY HLS corrigido!   ║');
   console.log('║  ✅  Player bypass SuperFlix ativado!            ║');
