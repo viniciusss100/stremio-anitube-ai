@@ -1,6 +1,6 @@
 {
-  "name": "stremio-anitube-superflix",
-  "version": "5.0.0",
+  "name": "stremio-anitube-superflix-v6",
+  "version": "6.0.0",
   "description": "Stremio Addon: AniTube.news + SuperFlixAPI (filmes, séries, animes BR)",
   "main": "addon.js",
   "scripts": {
