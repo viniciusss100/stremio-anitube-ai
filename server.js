@@ -2,12 +2,13 @@
 
 /**
  * ══════════════════════════════════════════════════════════════════
- *  Stremio Addon – AniTube.news  v3.3.0
- *  CORREÇÕES:
- *   - Proxy HLS agora lida com Master Playlist (multi-qualidade)
- *   - Sub-playlists (.m3u8 aninhadas) também são proxiadas
- *   - Segmentos .ts e .webp são corretamente proxiados
- *   - CORS habilitado para compatibilidade com Stremio Web
+ * Stremio Addon – AniTube.news  v3.3.0 + Bypass SuperFlix
+ * CORREÇÕES:
+ * - Proxy HLS agora lida com Master Playlist (multi-qualidade)
+ * - Sub-playlists (.m3u8 aninhadas) também são proxiadas
+ * - Segmentos .ts e .webp são corretamente proxiados
+ * - CORS habilitado para compatibilidade com Stremio Web
+ * - Player local adicionado para bypass da proteção de iframe
  * ══════════════════════════════════════════════════════════════════
  */
 
@@ -51,15 +52,6 @@ function resolveUrl(base, relative) {
 // ───────────────────────────────────────────────────────────────────────────
 // PROXY DE M3U8 — lida com Master Playlist e Media Playlist
 // ───────────────────────────────────────────────────────────────────────────
-
-/**
- * CORREÇÃO PRINCIPAL: O proxy agora distingue entre:
- *   1. Master Playlist  → contém linhas #EXT-X-STREAM-INF com URIs de sub-playlists
- *   2. Media Playlist   → contém segmentos (.ts, .webp, etc.)
- *
- * Em ambos os casos, as URIs são reescritas para passar pelo proxy local,
- * garantindo que os headers corretos (Referer, User-Agent) sejam enviados.
- */
 app.get('/proxy/m3u8', async (req, res) => {
   const { url, referer } = req.query;
   if (!url) return res.status(400).send('URL faltante');
@@ -86,7 +78,6 @@ app.get('/proxy/m3u8', async (req, res) => {
     const newLines = [];
     let isMaster   = false;
 
-    // Detectar se é Master Playlist (contém #EXT-X-STREAM-INF ou #EXT-X-MEDIA)
     if (content.includes('#EXT-X-STREAM-INF') || content.includes('#EXT-X-MEDIA:')) {
       isMaster = true;
     }
@@ -101,7 +92,6 @@ app.get('/proxy/m3u8', async (req, res) => {
       }
 
       if (trimmed.startsWith('#')) {
-        // Reescrever URIs dentro de tags como #EXT-X-MEDIA URI="..."
         const rewritten = trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
           const fullUri = resolveUrl(baseUrl, uri);
           const proxyUri = `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(fullUri)}&referer=${encodedReferer}`;
@@ -111,15 +101,12 @@ app.get('/proxy/m3u8', async (req, res) => {
         continue;
       }
 
-      // Linha de URI (segmento .ts/.webp ou sub-playlist .m3u8)
       const fullUrl = resolveUrl(baseUrl, trimmed);
 
       if (isMaster || trimmed.endsWith('.m3u8') || trimmed.includes('.m3u8?')) {
-        // Sub-playlist → rota pelo proxy de m3u8
         const proxyUrl = `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(fullUrl)}&referer=${encodedReferer}`;
         newLines.push(proxyUrl);
       } else {
-        // Segmento de vídeo → rota pelo proxy de segmento
         const proxyUrl = `${PUBLIC_URL}/proxy/segment?url=${encodeURIComponent(fullUrl)}&referer=${encodedReferer}`;
         newLines.push(proxyUrl);
       }
@@ -158,7 +145,6 @@ app.get('/proxy/segment', async (req, res) => {
     res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'public, max-age=3600');
 
-    // Repassar Content-Length se disponível (ajuda players a estimar duração)
     const contentLength = response.headers.get('content-length');
     if (contentLength) res.setHeader('Content-Length', contentLength);
 
@@ -168,6 +154,32 @@ app.get('/proxy/segment', async (req, res) => {
     console.error(`[Proxy Segmento] Erro: ${e.message}`);
     res.status(500).send(e.message);
   }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// PLAYER EMBED (Bypass de Proteção do SuperFlix)
+// ───────────────────────────────────────────────────────────────────────────
+app.get('/player', (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).send('URL faltante');
+
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>SuperFlix Player</title>
+      <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+        iframe { width: 100%; height: 100%; border: none; }
+      </style>
+    </head>
+    <body>
+      <iframe src="${url}" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>
+    </body>
+    </html>
+  `);
 });
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -182,6 +194,7 @@ app.listen(PORT, () => {
   console.log('║       Stremio Addon – AniTube.news  v3.3.0       ║');
   console.log('╠══════════════════════════════════════════════════╣');
   console.log('║  ✅  Servidor rodando com PROXY HLS corrigido!   ║');
+  console.log('║  ✅  Player bypass SuperFlix ativado!            ║');
   console.log('║                                                  ║');
   console.log(`║  📋  Para instalar no Stremio (Desktop):         ║`);
   console.log(`║      http://127.0.0.1:${PORT}/manifest.json         ║`);
