@@ -78,64 +78,114 @@ async function resolveNested(html, pageUrl, depth) {
   return [];
 }
 
-// DEBUG / fallback extractSuperFlix
+// Melhorado: extractSuperFlix com heurísticas para HTML ofuscado e fallback para domínios alternativos
 async function extractSuperFlix(id, isMovie, s, e) {
-  const SF = (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, '');
-  const url = isMovie ? SF + '/filme/' + id : SF + '/serie/' + id + '/' + s + '/' + e;
-  const altUrl = isMovie ? SF + '/embed/filme/' + id : SF + '/embed/serie/' + id + '/' + s + '/' + e;
+  const SF_CANDIDATES = [
+    (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, ''),
+    'https://superflixapi.rest'
+  ];
+  const pathMain = isMovie ? '/filme/' + id : '/serie/' + id + '/' + s + '/' + e;
+  const pathAlt  = isMovie ? '/filme/' + id : '/serie/' + id + '/' + s + '/' + e;
 
-  const tryUrl = async (u) => {
+  // Headers mais completos para reduzir bloqueios
+  const commonHeaders = {
+    'User-Agent': UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Referer': 'https://google.com/',
+    'Connection': 'keep-alive',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Dest': 'document'
+  };
+
+  async function tryFetch(u) {
     const start = Date.now();
     try {
       console.log('[SuperFlix] GET', u);
-      const r = await safeFetch(u, {
-        headers: {
-          'User-Agent': UA,
-          'Referer': SF + '/',
-          'Origin': SF,
-          'Accept': 'text/html,*/*',
-        },
-      }, 15000);
+      const r = await safeFetch(u, { headers: commonHeaders }, 20000);
       const took = Date.now() - start;
       console.log('[SuperFlix] Response', r.status, 'took', took + 'ms', 'for', u);
       const text = await r.text();
-      const snippet = text ? text.substring(0, 1200).replace(/\n/g, ' ') : '';
+      const snippet = text ? text.substring(0, 1600).replace(/\n/g, ' ') : '';
       console.log('[SuperFlix] Body snippet:', snippet);
-      if (/cloudflare|attention required|captcha|bot verification|jschl_vc/i.test(snippet)) {
-        console.warn('[SuperFlix] Possível bloqueio anti-bot detectado em', u);
-        return { ok: false, blocked: true, html: text };
-      }
-      if (!r.ok) return { ok: false, blocked: false, html: text };
-      const found = await resolveNested(text, u);
-      return { ok: true, blocked: false, html: text, found };
+      return { ok: r.ok, status: r.status, html: text };
     } catch (err) {
       console.warn('[SuperFlix] Erro fetch', err.message, 'para', u);
-      return { ok: false, blocked: false, error: err.message };
-    }
-  };
-
-  const res1 = await tryUrl(url);
-  if (res1.ok && Array.isArray(res1.found) && res1.found.length) {
-    return res1.found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
-  }
-
-  if (res1.blocked || !res1.ok || (res1.found && res1.found.length === 0)) {
-    console.log('[SuperFlix] Tentando fallback embed URL:', altUrl);
-    const res2 = await tryUrl(altUrl);
-    if (res2.ok && Array.isArray(res2.found) && res2.found.length) {
-      return res2.found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
-    }
-    if (res2.blocked) {
-      console.warn('[SuperFlix] Bloqueio detectado no embed fallback para id', id);
-      return [];
+      return { ok: false, error: err.message, html: '' };
     }
   }
 
-  if (res1.ok && res1.found && res1.found.length === 0) {
-    console.log('[SuperFlix] Nenhum media encontrado nas páginas para id', id);
+  // 1) tenta candidatos diretos (evita redirect)
+  for (const base of SF_CANDIDATES) {
+    const url = base + pathMain;
+    const res = await tryFetch(url);
+    if (res.ok) {
+      // tenta extrair nested normalmente
+      const found = await resolveNested(res.html, url);
+      if (found && found.length) {
+        return found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
+      }
+
+      // Se não encontrou, tenta heurística: extrair todas as URLs do HTML e testar cada uma
+      // (útil quando player está dentro de script ofuscado ou carregado por src externo)
+      const urls = new Set();
+      const urlRegex = /https?:\/\/[^\s"'<>]+/g;
+      let m;
+      while ((m = urlRegex.exec(res.html)) !== null) {
+        const candidate = m[0].replace(/&amp;/g, '&');
+        // filtra domínios irrelevantes
+        if (/googletagmanager|doubleclick|analytics|recaptcha|chorumebbbbgoza|ads|adservice/i.test(candidate)) continue;
+        urls.add(candidate);
+      }
+
+      // Tenta cada URL encontrada (limitado a 20 para evitar loops)
+      let tries = 0;
+      for (const u of urls) {
+        if (tries++ > 20) break;
+        try {
+          const r2 = await safeFetch(u, { headers: commonHeaders }, 15000);
+          if (!r2 || !r2.ok) continue;
+          const html2 = await r2.text();
+          const nested = await resolveNested(html2, u);
+          if (nested && nested.length) {
+            return nested.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
+          }
+        } catch (_) {}
+      }
+
+      // nada encontrado neste base, tenta próximo candidate
+    } else {
+      // se status 301/302, tenta seguir location manualmente
+      if (res.status === 301 || res.status === 302) {
+        // safeFetch normalmente segue redirects, mas logamos para debug
+        console.log('[SuperFlix] Redirect recebido para', base + pathMain);
+      }
+    }
   }
+
+  // 2) fallback: tenta endpoints alternativos conhecidos (ex.: /player, /watch) — adicionar conforme necessário
+  const altPaths = [
+    isMovie ? '/watch/filme/' + id : '/watch/serie/' + id + '/' + s + '/' + e,
+    isMovie ? '/player/filme/' + id : '/player/serie/' + id + '/' + s + '/' + e
+  ];
+  for (const base of SF_CANDIDATES) {
+    for (const p of altPaths) {
+      try {
+        const res = await tryFetch(base + p);
+        if (res.ok) {
+          const found = await resolveNested(res.html, base + p);
+          if (found && found.length) return found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
+        }
+      } catch (_) {}
+    }
+  }
+
+  // 3) se chegou aqui, não encontrou nada
+  console.log('[SuperFlix] Nenhum media encontrado para id', id);
   return [];
 }
+
 
 // ── Função principal ──────────────────────────────────────────────────────────
 async function getAllStreams(imdbId, type, season, episode) {
