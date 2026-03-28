@@ -78,23 +78,64 @@ async function resolveNested(html, pageUrl, depth) {
   return [];
 }
 
-// 1 SuperFlixAPI
+// DEBUG / fallback extractSuperFlix
 async function extractSuperFlix(id, isMovie, s, e) {
   const SF = (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, '');
-  // id pode ser 'tt...' ou numérico; o endpoint aceita ambos (filme/serie/<id>/s/e)
   const url = isMovie ? SF + '/filme/' + id : SF + '/serie/' + id + '/' + s + '/' + e;
-  try {
-    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': SF + '/', 'Origin': SF, 'Accept': 'text/html,*/*' } });
-    if (!r.ok) {
-      console.warn('[SuperFlix] HTTP', r.status, 'para', url);
+  const altUrl = isMovie ? SF + '/embed/filme/' + id : SF + '/embed/serie/' + id + '/' + s + '/' + e;
+
+  const tryUrl = async (u) => {
+    const start = Date.now();
+    try {
+      console.log('[SuperFlix] GET', u);
+      const r = await safeFetch(u, {
+        headers: {
+          'User-Agent': UA,
+          'Referer': SF + '/',
+          'Origin': SF,
+          'Accept': 'text/html,*/*',
+        },
+      }, 15000);
+      const took = Date.now() - start;
+      console.log('[SuperFlix] Response', r.status, 'took', took + 'ms', 'for', u);
+      const text = await r.text();
+      const snippet = text ? text.substring(0, 1200).replace(/\n/g, ' ') : '';
+      console.log('[SuperFlix] Body snippet:', snippet);
+      if (/cloudflare|attention required|captcha|bot verification|jschl_vc/i.test(snippet)) {
+        console.warn('[SuperFlix] Possível bloqueio anti-bot detectado em', u);
+        return { ok: false, blocked: true, html: text };
+      }
+      if (!r.ok) return { ok: false, blocked: false, html: text };
+      const found = await resolveNested(text, u);
+      return { ok: true, blocked: false, html: text, found };
+    } catch (err) {
+      console.warn('[SuperFlix] Erro fetch', err.message, 'para', u);
+      return { ok: false, blocked: false, error: err.message };
+    }
+  };
+
+  const res1 = await tryUrl(url);
+  if (res1.ok && Array.isArray(res1.found) && res1.found.length) {
+    return res1.found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
+  }
+
+  if (res1.blocked || !res1.ok || (res1.found && res1.found.length === 0)) {
+    console.log('[SuperFlix] Tentando fallback embed URL:', altUrl);
+    const res2 = await tryUrl(altUrl);
+    if (res2.ok && Array.isArray(res2.found) && res2.found.length) {
+      return res2.found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
+    }
+    if (res2.blocked) {
+      console.warn('[SuperFlix] Bloqueio detectado no embed fallback para id', id);
       return [];
     }
-    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m); });
-  } catch (err) { console.warn('[SuperFlix] Erro:', err.message); return []; }
-}
+  }
 
-// ... demais extractors (VidSrc, 2Embed, MultiEmbed, GoDrive) permanecem iguais ...
-// Para brevidade, mantenha o resto do seu arquivo original aqui (extractVidSrcCC, extractVidSrcMe, ...)
+  if (res1.ok && res1.found && res1.found.length === 0) {
+    console.log('[SuperFlix] Nenhum media encontrado nas páginas para id', id);
+  }
+  return [];
+}
 
 // ── Função principal ──────────────────────────────────────────────────────────
 async function getAllStreams(imdbId, type, season, episode) {
