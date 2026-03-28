@@ -1,9 +1,7 @@
 'use strict';
 
 /**
- * providers.js — v5.1.0 (modificado)
- *
- * Exporta extractSuperFlix individualmente para uso direto quando ID for sf:...
+ * providers.js — versão simplificada (Somente provedores que não são SuperFlix)
  */
 
 const fetch = require('node-fetch');
@@ -78,114 +76,79 @@ async function resolveNested(html, pageUrl, depth) {
   return [];
 }
 
-// Melhorado: extractSuperFlix com heurísticas para HTML ofuscado e fallback para domínios alternativos
-async function extractSuperFlix(id, isMovie, s, e) {
-  const SF_CANDIDATES = [
-    (process.env.SF_BASE_URL || 'https://superflixapi.run').replace(/\/$/, ''),
-    'https://superflixapi.rest'
-  ];
-  const pathMain = isMovie ? '/filme/' + id : '/serie/' + id + '/' + s + '/' + e;
-  const pathAlt  = isMovie ? '/filme/' + id : '/serie/' + id + '/' + s + '/' + e;
-
-  // Headers mais completos para reduzir bloqueios
-  const commonHeaders = {
-    'User-Agent': UA,
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer': 'https://google.com/',
-    'Connection': 'keep-alive',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Dest': 'document'
-  };
-
-  async function tryFetch(u) {
-    const start = Date.now();
-    try {
-      console.log('[SuperFlix] GET', u);
-      const r = await safeFetch(u, { headers: commonHeaders }, 20000);
-      const took = Date.now() - start;
-      console.log('[SuperFlix] Response', r.status, 'took', took + 'ms', 'for', u);
-      const text = await r.text();
-      const snippet = text ? text.substring(0, 1600).replace(/\n/g, ' ') : '';
-      console.log('[SuperFlix] Body snippet:', snippet);
-      return { ok: r.ok, status: r.status, html: text };
-    } catch (err) {
-      console.warn('[SuperFlix] Erro fetch', err.message, 'para', u);
-      return { ok: false, error: err.message, html: '' };
-    }
-  }
-
-  // 1) tenta candidatos diretos (evita redirect)
-  for (const base of SF_CANDIDATES) {
-    const url = base + pathMain;
-    const res = await tryFetch(url);
-    if (res.ok) {
-      // tenta extrair nested normalmente
-      const found = await resolveNested(res.html, url);
-      if (found && found.length) {
-        return found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
-      }
-
-      // Se não encontrou, tenta heurística: extrair todas as URLs do HTML e testar cada uma
-      // (útil quando player está dentro de script ofuscado ou carregado por src externo)
-      const urls = new Set();
-      const urlRegex = /https?:\/\/[^\s"'<>]+/g;
-      let m;
-      while ((m = urlRegex.exec(res.html)) !== null) {
-        const candidate = m[0].replace(/&amp;/g, '&');
-        // filtra domínios irrelevantes
-        if (/googletagmanager|doubleclick|analytics|recaptcha|chorumebbbbgoza|ads|adservice/i.test(candidate)) continue;
-        urls.add(candidate);
-      }
-
-      // Tenta cada URL encontrada (limitado a 20 para evitar loops)
-      let tries = 0;
-      for (const u of urls) {
-        if (tries++ > 20) break;
-        try {
-          const r2 = await safeFetch(u, { headers: commonHeaders }, 15000);
-          if (!r2 || !r2.ok) continue;
-          const html2 = await r2.text();
-          const nested = await resolveNested(html2, u);
-          if (nested && nested.length) {
-            return nested.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
-          }
-        } catch (_) {}
-      }
-
-      // nada encontrado neste base, tenta próximo candidate
-    } else {
-      // se status 301/302, tenta seguir location manualmente
-      if (res.status === 301 || res.status === 302) {
-        // safeFetch normalmente segue redirects, mas logamos para debug
-        console.log('[SuperFlix] Redirect recebido para', base + pathMain);
-      }
-    }
-  }
-
-  // 2) fallback: tenta endpoints alternativos conhecidos (ex.: /player, /watch) — adicionar conforme necessário
-  const altPaths = [
-    isMovie ? '/watch/filme/' + id : '/watch/serie/' + id + '/' + s + '/' + e,
-    isMovie ? '/player/filme/' + id : '/player/serie/' + id + '/' + s + '/' + e
-  ];
-  for (const base of SF_CANDIDATES) {
-    for (const p of altPaths) {
-      try {
-        const res = await tryFetch(base + p);
-        if (res.ok) {
-          const found = await resolveNested(res.html, base + p);
-          if (found && found.length) return found.map(m => makeStream('🇧🇷 SuperFlix BR', 'SuperFlixAPI', m));
-        }
-      } catch (_) {}
-    }
-  }
-
-  // 3) se chegou aqui, não encontrou nada
-  console.log('[SuperFlix] Nenhum media encontrado para id', id);
-  return [];
+// 1 VidSrc.cc
+async function extractVidSrcCC(id, isMovie, s, e) {
+  const url = isMovie ? 'https://vidsrc.cc/v2/embed/movie/' + id : 'https://vidsrc.cc/v2/embed/tv/' + id + '/' + s + '/' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://vidsrc.cc/' } });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('📺 VidSrc', 'VidSrc.cc', m); });
+  } catch (err) { console.warn('[VidSrc.cc] Erro:', err.message); return []; }
 }
 
+// 2 VidSrc.me
+async function extractVidSrcMe(id, isMovie, s, e) {
+  const url = isMovie ? 'https://vidsrc.me/embed/movie?imdb=' + id : 'https://vidsrc.me/embed/tv?imdb=' + id + '&season=' + s + '&episode=' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://vidsrc.me/' } });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('📺 VidSrc.me', 'VidSrc.me', m); });
+  } catch (err) { console.warn('[VidSrc.me] Erro:', err.message); return []; }
+}
+
+// 3 VidSrc.mov
+async function extractVidSrcMov(id, isMovie, s, e) {
+  const url = isMovie ? 'https://vidsrc.mov/embed/movie/' + id : 'https://vidsrc.mov/embed/tv/' + id + '/' + s + '/' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://vidsrc.mov/' } });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('📺 VidSrc.mov', 'VidSrc.mov', m); });
+  } catch (err) { console.warn('[VidSrc.mov] Erro:', err.message); return []; }
+}
+
+// 4 VidSrc.icu
+async function extractVidSrcIcu(id, isMovie, s, e) {
+  const url = isMovie ? 'https://vidsrc.icu/embed/movie/' + id : 'https://vidsrc.icu/embed/tv/' + id + '/' + s + '/' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://vidsrc.icu/' } });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('📺 VidSrc.icu', 'VidSrc.icu', m); });
+  } catch (err) { console.warn('[VidSrc.icu] Erro:', err.message); return []; }
+}
+
+// 5 2Embed.stream
+async function extract2Embed(id, isMovie, s, e) {
+  const url = isMovie ? 'https://www.2embed.stream/embed/movie/' + id : 'https://www.2embed.stream/embed/tv/' + id + '/' + s + '/' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://www.2embed.stream/' } });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('📡 2Embed', '2Embed.stream', m); });
+  } catch (err) { console.warn('[2Embed] Erro:', err.message); return []; }
+}
+
+// 6 MultiEmbed VIP
+async function extractMultiEmbed(id, isMovie, s, e) {
+  const url = isMovie
+    ? 'https://multiembed.mov/directstream.php?video_id=' + id
+    : 'https://multiembed.mov/directstream.php?video_id=' + id + '&s=' + s + '&e=' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://multiembed.mov/' }, redirect: 'follow' });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('🌐 SuperEmbed', 'SuperEmbed VIP', m); });
+  } catch (err) { console.warn('[MultiEmbed] Erro:', err.message); return []; }
+}
+
+// 7 GoDrivePlayer
+async function extractGoDrive(id, isMovie, s, e) {
+  const url = isMovie
+    ? 'https://godriveplayer.com/player.php?imdb=' + id
+    : 'https://godriveplayer.com/player.php?imdb=' + id + '&season=' + s + '&episode=' + e;
+  try {
+    const r = await safeFetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://godriveplayer.com/' } });
+    if (!r.ok) return [];
+    return (await resolveNested(await r.text(), url)).map(function(m) { return makeStream('☁️ GoDrive', 'GoDrivePlayer', m); });
+  } catch (err) { console.warn('[GoDrive] Erro:', err.message); return []; }
+}
 
 // ── Função principal ──────────────────────────────────────────────────────────
 async function getAllStreams(imdbId, type, season, episode) {
@@ -195,15 +158,14 @@ async function getAllStreams(imdbId, type, season, episode) {
   console.log('[Providers] ' + imdbId + ' | ' + (isMovie ? 'Filme' : 'Série S' + s + 'E' + e));
 
   const results = await Promise.allSettled([
-    extractSuperFlix(imdbId, isMovie, s, e),
-    // mantenha as outras chamadas conforme seu arquivo original
-    // extractVidSrcCC(imdbId, isMovie, s, e),
-    // extractVidSrcMe(imdbId, isMovie, s, e),
-    // extractVidSrcMov(imdbId, isMovie, s, e),
-    // extractVidSrcIcu(imdbId, isMovie, s, e),
-    // extract2Embed(imdbId, isMovie, s, e),
-    // extractMultiEmbed(imdbId, isMovie, s, e),
-    // extractGoDrive(imdbId, isMovie, s, e),
+    // Removido SuperFlix; mantemos os demais provedores
+    extractVidSrcCC(imdbId, isMovie, s, e),
+    extractVidSrcMe(imdbId, isMovie, s, e),
+    extractVidSrcMov(imdbId, isMovie, s, e),
+    extractVidSrcIcu(imdbId, isMovie, s, e),
+    extract2Embed(imdbId, isMovie, s, e),
+    extractMultiEmbed(imdbId, isMovie, s, e),
+    extractGoDrive(imdbId, isMovie, s, e),
   ]);
 
   const all = [];
@@ -214,4 +176,4 @@ async function getAllStreams(imdbId, type, season, episode) {
   return all;
 }
 
-module.exports = { getAllStreams, extractSuperFlix };
+module.exports = { getAllStreams };
