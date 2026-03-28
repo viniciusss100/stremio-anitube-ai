@@ -167,8 +167,8 @@ builder.defineStreamHandler(async ({ id, type }) => {
 
       if (type === 'movie') return { streams: [] }; // AniTube não tem filmes
 
-      const title = await resolveImdbTitle(imdbId);
-      if (title) streams = await searchAndExtract(title, [], season, episode);
+      const { title, aliases } = await resolveImdbTitle(imdbId);
+      if (title) streams = await searchAndExtract(title, aliases, season, episode);
 
     } else if (id.startsWith('kitsu:')) {
       // ── ID Kitsu ──────────────────────────────────────────────────────────
@@ -201,18 +201,21 @@ async function extractAniTubeById(epId) {
   return extractStreams(sr.sources, sr.episodeUrl);
 }
 
-// Resolve título de um ID IMDB via Cinemeta
+// Resolve título e aliases de um ID IMDB via Cinemeta
 async function resolveImdbTitle(imdbId) {
   try {
     const r = await fetch(
       `https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`,
       { timeout: 8000 }
     );
-    if (!r.ok) return null;
+    if (!r.ok) return { title: null, aliases: [] };
     const j = await r.json();
-    return j?.meta?.name || null;
+    return {
+      title  : j?.meta?.name    || null,
+      aliases: j?.meta?.aliases || [],
+    };
   } catch (_) {
-    return null;
+    return { title: null, aliases: [] };
   }
 }
 
@@ -234,29 +237,61 @@ async function resolveKitsuTitle(kitsuId) {
   }
 }
 
-// Busca o anime no AniTube e extrai a stream do episódio correto.
-// Tenta múltiplas variações do título para aumentar o match.
-async function searchAndExtract(title, aliases, season, episode) {
-  // Gera variações de busca priorizando as mais simples
-  const queries = buildQueries(title, aliases);
+// ── Busca com verificação de relevância ───────────────────────────────────────
+//
+// Problema que isso resolve:
+//   "Demon Slayer" → AniTube retorna "Slayers" como primeiro resultado
+//   porque o site usa o nome JP "Kimetsu no Yaiba".
+//
+// Solução:
+//   1. Gera queries priorizando aliases JP (que é como o AniTube cataloga)
+//   2. Para cada query, verifica se algum resultado tem similaridade suficiente
+//      com qualquer forma conhecida do título (EN + aliases)
+//   3. Só aceita um resultado se ele passa no threshold de similaridade
 
-  let results = [];
+const SIMILARITY_THRESHOLD = 0.45; // 0 = nada em comum, 1 = idêntico
+
+async function searchAndExtract(title, aliases, season, episode) {
+  const queries   = buildQueries(title, aliases);
+  const allTitles = buildAllTitles(title, aliases); // todas as formas conhecidas do anime
+
+  let bestMatch = null;
+  let bestScore = 0;
+  let matchedQuery = '';
+
   for (const q of queries) {
+    let results;
     try {
       results = await scraper.searchAnimes(q);
-      if (results.length > 0) {
-        console.log(`[AniTube] Match: "${q}" → "${results[0].name}"`);
-        break;
+    } catch (_) {
+      continue;
+    }
+    if (!results?.length) continue;
+
+    // Para cada resultado, calcula o score máximo contra todas as formas do título
+    for (const candidate of results) {
+      const candidateName = candidate.name || '';
+      const score = allTitles.reduce((max, t) => Math.max(max, similarity(t, candidateName)), 0);
+
+      if (score > bestScore) {
+        bestScore  = score;
+        bestMatch  = candidate;
+        matchedQuery = q;
       }
-    } catch (_) {}
+    }
+
+    // Se encontrou match forte o suficiente, para de buscar
+    if (bestScore >= SIMILARITY_THRESHOLD) break;
   }
 
-  if (!results.length) {
-    console.warn(`[AniTube] Sem resultados para "${title}"`);
+  if (!bestMatch || bestScore < SIMILARITY_THRESHOLD) {
+    console.warn(`[AniTube] Sem match confiável para "${title}" (melhor score: ${bestScore.toFixed(2)})`);
     return [];
   }
 
-  const animeId = results[0].id.replace('anitube:', '');
+  console.log(`[AniTube] Match: "${matchedQuery}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
+
+  const animeId = bestMatch.id.replace('anitube:', '');
   const epId    = await resolveEpisodeId(animeId, episode);
   return extractAniTubeById(epId);
 }
@@ -278,34 +313,111 @@ async function resolveEpisodeId(animeId, episode) {
   }
 }
 
-// Gera variações do título para aumentar chance de match no AniTube
+// Gera queries de busca ordenadas por probabilidade de match no AniTube.
+// Prioridade: aliases JP > título EN simplificado > título EN completo.
+// O AniTube cataloga animes pelo nome JP — aliases costumam tê-lo.
 function buildQueries(title, aliases) {
   const seen    = new Set();
-  const queries = [];
+  const jpFirst = []; // aliases (geralmente JP) — têm prioridade
+  const enLast  = []; // título EN
 
-  function add(s) {
+  function addTo(arr, s) {
     if (!s || s.length < 2) return;
     const clean = s.trim();
-    if (!seen.has(clean)) { seen.add(clean); queries.push(clean); }
+    if (!seen.has(clean)) { seen.add(clean); arr.push(clean); }
   }
 
-  // Título limpo (sem "(Dub)", sem subtítulo após ":" ou " - ")
-  add(title.replace(/\s*\(Dub\)/i, '').split(':')[0].split(' - ')[0].trim());
-  // Título sem "(Dub)" mas com subtítulo
-  add(title.replace(/\s*\(Dub\)/i, '').trim());
-  // Título original completo
+  // Aliases primeiro (incluem nome JP que o AniTube usa)
+  if (Array.isArray(aliases)) {
+    for (const a of aliases) {
+      if (typeof a !== 'string') continue;
+      addTo(jpFirst, a.split(':')[0].split(' - ')[0].trim());
+      addTo(jpFirst, a.trim());
+    }
+  }
+
+  // Título EN: versão simplificada (sem subtítulo) e completa
+  addTo(enLast, title.replace(/\s*\(Dub\)/i, '').split(':')[0].split(' - ')[0].trim());
+  addTo(enLast, title.replace(/\s*\(Dub\)/i, '').trim());
+  addTo(enLast, title);
+
+  return [...jpFirst, ...enLast];
+}
+
+// Retorna todas as formas conhecidas do título, normalizadas para comparação
+function buildAllTitles(title, aliases) {
+  const titles = new Set();
+
+  function add(s) {
+    if (s && s.length > 1) titles.add(normalize(s));
+  }
+
   add(title);
-  // Aliases (nomes alternativos da API)
+  add(title.replace(/\s*\(Dub\)/i, '').trim());
+  add(title.split(':')[0].trim());
+
   if (Array.isArray(aliases)) {
     for (const a of aliases) {
       if (typeof a === 'string') {
-        add(a.split(':')[0].split(' - ')[0].trim());
-        add(a.trim());
+        add(a);
+        add(a.split(':')[0].trim());
       }
     }
   }
 
-  return queries;
+  return [...titles];
+}
+
+// Normaliza string para comparação: minúsculas, sem pontuação, sem artigos
+function normalize(s) {
+  return s
+    .toLowerCase()
+    .replace(/[:\-–—]/g, ' ')
+    .replace(/[^\w\s]/g, '')
+    .replace(/\b(the|a|an|no|wo|wa|ga|de|ni|to)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Similaridade entre dois strings — combina Jaccard (palavras) + Dice (bigrams).
+// Retorna valor entre 0 (nada em comum) e 1 (idênticos).
+function similarity(a, b) {
+  const na = normalize(a);
+  const nb = normalize(b);
+  if (na === nb) return 1;
+  if (!na || !nb) return 0;
+
+  // Containment: se um contém o outro integralmente
+  if (na.includes(nb) || nb.includes(na)) {
+    return Math.min(na.length, nb.length) / Math.max(na.length, nb.length);
+  }
+
+  // Jaccard sobre palavras individuais — bom para títulos curtos
+  const setA = new Set(na.split(' ').filter(Boolean));
+  const setB = new Set(nb.split(' ').filter(Boolean));
+  let wordInter = 0;
+  for (const w of setA) if (setB.has(w)) wordInter++;
+  const jaccard = wordInter / (setA.size + setB.size - wordInter);
+
+  // Dice sobre bigrams — bom para frases mais longas
+  const bgA = new Set(bigrams(na));
+  const bgB = new Set(bigrams(nb));
+  let bgInter = 0;
+  for (const bg of bgA) if (bgB.has(bg)) bgInter++;
+  const dice = (bgA.size + bgB.size) > 0 ? (2 * bgInter) / (bgA.size + bgB.size) : 0;
+
+  return Math.max(jaccard, dice);
+}
+
+// Gera bigrams de palavras de uma string normalizada
+function bigrams(s) {
+  const words = s.split(' ').filter(Boolean);
+  if (words.length === 1) return words; // palavra única: retorna ela mesma
+  const out = [];
+  for (let i = 0; i < words.length - 1; i++) {
+    out.push(`${words[i]} ${words[i + 1]}`);
+  }
+  return out;
 }
 
 module.exports = builder.getInterface();
