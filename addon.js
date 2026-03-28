@@ -14,8 +14,8 @@ function cacheSet(k,v) { cache.set(k,{value:v,ts:Date.now()}); }
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
-  id: 'community.anitube.superflix.v6',
-  version: '6.0.0',
+  id: 'community.anitube.superflix.v7',
+  version: '7.0.0',
   name: '🎌🎬 AniTube + SuperFlix BR',
   description: 'AniTube.news (animes) + SuperFlixAPI (filmes/séries BR) com streams reais extraídas de VidSrc, AutoEmbed, 2Embed e mais.',
   logo: 'https://www.anitube.news/wp-content/uploads/logo-anitube-2.png',
@@ -143,14 +143,17 @@ builder.defineStreamHandler(async ({ id, type }) => {
     else if (id.startsWith('tt')) {
       const parts   = id.split(':');
       const imdbId  = parts[0];
-      const season  = parts[1] ? parseInt(parts[1], 10) : null;
-      const episode = parts[2] ? parseInt(parts[2], 10) : null;
-      const isMovie = type === 'movie' || season === null;
+      // CORREÇÃO: season/episode podem ser undefined — parse só se existir
+      const season  = parts[1] !== undefined ? parseInt(parts[1], 10) : null;
+      const episode = parts[2] !== undefined ? parseInt(parts[2], 10) : null;
+      // CORREÇÃO: isMovie determinado pelo type recebido, não pela ausência de season
+      // O Stremio pode enviar "tt123" sem season mesmo para séries em alguns contextos
+      const isMovie = (type === 'movie');
 
-      // Busca em paralelo: SuperFlix + VidSrc + AutoEmbed + 2Embed + GoDrive
-      streams = await getAllStreams(imdbId, isMovie ? 'movie' : 'series', season, episode);
+      // Busca em paralelo nos 7 provedores
+      streams = await getAllStreams(imdbId, type, season, episode);
 
-      // Fallback AniTube para animes (type series)
+      // Fallback AniTube para séries/animes quando provedores retornam pouco
       if (!isMovie && streams.length < 2) {
         const atStreams = await tryAniTube(imdbId, season, episode);
         streams.push(...atStreams);
