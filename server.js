@@ -1,42 +1,36 @@
 'use strict';
 
 /**
- * ══════════════════════════════════════════════════════════════════
- * Stremio Addon – AniTube + SuperFlix BR  v8.0.0 + Bypass SuperFlix
- * CORREÇÕES:
- * - Proxy HLS agora lida com Master Playlist (multi-qualidade)
- * - Sub-playlists (.m3u8 aninhadas) também são proxiadas
- * - Segmentos .ts e .webp são corretamente proxiados
- * - CORS habilitado para compatibilidade com Stremio Web
- * - Player local adicionado para bypass da proteção de iframe
- * ══════════════════════════════════════════════════════════════════
+ * server.js — AniTube.news Stremio Addon v4.0.0
+ *
+ * Rotas:
+ *   GET /proxy/m3u8    — Proxy de playlists HLS (master + media + segmentos)
+ *   GET /proxy/segment — Proxy de segmentos de vídeo (.ts, .webp)
+ *   /*                 — Stremio Addon SDK (manifest, catalog, meta, stream)
  */
 
 require('dotenv').config();
+
 const express = require('express');
 const fetch   = require('node-fetch');
 const { getRouter } = require('stremio-addon-sdk');
 const addonInterface = require('./addon');
 
-const app  = express();
-const PORT = parseInt(process.env.PORT || '7000', 10);
-const PUBLIC_URL = process.env.PUBLIC_URL || `http://127.0.0.1:${PORT}`;
+const app        = express();
+const PORT       = parseInt(process.env.PORT || '7000', 10);
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 
-const UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 ' +
-           '(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36';
+const UA_PROXY = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 ' +
+                 '(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36';
 
-// ───────────────────────────────────────────────────────────────────────────
-// CORS — necessário para Stremio Web e players externos
-// ───────────────────────────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
 
-// ───────────────────────────────────────────────────────────────────────────
-// UTILITÁRIO: resolver URL relativa a partir de uma base
-// ───────────────────────────────────────────────────────────────────────────
+// ── Utilitário: resolve URL relativa em relação a uma base ────────────────────
 function resolveUrl(base, relative) {
   if (!relative) return base;
   if (relative.startsWith('http://') || relative.startsWith('https://')) return relative;
@@ -44,138 +38,112 @@ function resolveUrl(base, relative) {
   try {
     return new URL(relative, base).toString();
   } catch (_) {
-    const baseDir = base.substring(0, base.lastIndexOf('/') + 1);
-    return baseDir + relative;
+    return base.substring(0, base.lastIndexOf('/') + 1) + relative;
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// PROXY DE M3U8 — lida com Master Playlist e Media Playlist
-// ───────────────────────────────────────────────────────────────────────────
+// ── Proxy M3U8 ────────────────────────────────────────────────────────────────
+// Reescreve URLs de segmentos e sub-playlists para passarem pelo proxy,
+// garantindo que os headers corretos (Referer, UA) sejam enviados.
 app.get('/proxy/m3u8', async (req, res) => {
   const { url, referer } = req.query;
-  if (!url) return res.status(400).send('URL faltante');
-
-  console.log(`[Proxy M3U8] Processando: ${url}`);
+  if (!url) return res.status(400).send('Parâmetro "url" obrigatório');
 
   try {
-    const response = await fetch(url, {
+    const upstream = await fetch(url, {
       headers: {
-        'User-Agent': UA,
+        'User-Agent': UA_PROXY,
         'Referer'   : referer || 'https://www.anitube.news/',
         'Origin'    : 'https://www.anitube.news',
         'Accept'    : '*/*',
       },
     });
 
-    if (!response.ok) throw new Error(`HTTP ${response.status} para ${url}`);
+    if (!upstream.ok) {
+      return res.status(upstream.status).send(`Upstream retornou ${upstream.status}`);
+    }
 
-    const content = await response.text();
+    const text    = await upstream.text();
     const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
-    const encodedReferer = encodeURIComponent(referer || 'https://www.anitube.news/');
+    const encRef  = encodeURIComponent(referer || 'https://www.anitube.news/');
 
-    const lines    = content.split('\n');
-    const newLines = [];
-    let isMaster   = false;
+    // Detecta se é Master Playlist (contém referências a sub-playlists)
+    const isMaster = text.includes('#EXT-X-STREAM-INF') || text.includes('#EXT-X-MEDIA:');
 
-    if (content.includes('#EXT-X-STREAM-INF') || content.includes('#EXT-X-MEDIA:')) {
-      isMaster = true;
-    }
+    const rewritten = text.split('\n').map(raw => {
+      const line = raw.trim();
+      if (!line) return raw;
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmed = line.trim();
-
-      if (!trimmed) {
-        newLines.push(line);
-        continue;
-      }
-
-      if (trimmed.startsWith('#')) {
-        const rewritten = trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
-          const fullUri = resolveUrl(baseUrl, uri);
-          const proxyUri = `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(fullUri)}&referer=${encodedReferer}`;
-          return `URI="${proxyUri}"`;
+      // Linha de comentário/tag — reescreve apenas URI="..." dentro das tags
+      if (line.startsWith('#')) {
+        return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+          const full = resolveUrl(baseUrl, uri);
+          return `URI="${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(full)}&referer=${encRef}"`;
         });
-        newLines.push(rewritten);
-        continue;
       }
 
-      const fullUrl = resolveUrl(baseUrl, trimmed);
-
-      if (isMaster || trimmed.endsWith('.m3u8') || trimmed.includes('.m3u8?')) {
-        const proxyUrl = `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(fullUrl)}&referer=${encodedReferer}`;
-        newLines.push(proxyUrl);
-      } else {
-        const proxyUrl = `${PUBLIC_URL}/proxy/segment?url=${encodeURIComponent(fullUrl)}&referer=${encodedReferer}`;
-        newLines.push(proxyUrl);
+      // Linha de URI — sub-playlist ou segmento
+      const full = resolveUrl(baseUrl, line);
+      if (isMaster || line.endsWith('.m3u8') || line.includes('.m3u8?')) {
+        return `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(full)}&referer=${encRef}`;
       }
-    }
+      return `${PUBLIC_URL}/proxy/segment?url=${encodeURIComponent(full)}&referer=${encRef}`;
+
+    }).join('\n');
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache');
-    res.send(newLines.join('\n'));
+    res.send(rewritten);
 
   } catch (e) {
-    console.error(`[Proxy M3U8] Erro: ${e.message}`);
+    console.error('[Proxy M3U8]', e.message);
     res.status(500).send(e.message);
   }
 });
 
-// ───────────────────────────────────────────────────────────────────────────
-// PROXY DE SEGMENTO — serve .ts, .webp e outros segmentos de vídeo
-// ───────────────────────────────────────────────────────────────────────────
+// ── Proxy Segmento ────────────────────────────────────────────────────────────
 app.get('/proxy/segment', async (req, res) => {
   const { url, referer } = req.query;
-  if (!url) return res.status(400).send('URL faltante');
+  if (!url) return res.status(400).send('Parâmetro "url" obrigatório');
 
   try {
-    const response = await fetch(url, {
+    const upstream = await fetch(url, {
       headers: {
-        'User-Agent': UA,
+        'User-Agent': UA_PROXY,
         'Referer'   : referer || 'https://www.anitube.news/',
         'Origin'    : 'https://www.anitube.news',
         'Accept'    : '*/*',
       },
     });
 
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!upstream.ok) {
+      return res.status(upstream.status).send(`Upstream retornou ${upstream.status}`);
+    }
 
-    const contentType = response.headers.get('content-type') || 'video/mp2t';
-    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp2t');
     res.setHeader('Cache-Control', 'public, max-age=3600');
 
-    const contentLength = response.headers.get('content-length');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
+    const len = upstream.headers.get('content-length');
+    if (len) res.setHeader('Content-Length', len);
 
-    response.body.pipe(res);
+    upstream.body.pipe(res);
 
   } catch (e) {
-    console.error(`[Proxy Segmento] Erro: ${e.message}`);
+    console.error('[Proxy Segmento]', e.message);
     res.status(500).send(e.message);
   }
 });
 
-
-// ───────────────────────────────────────────────────────────────────────────
-// STREMIO ADDON SDK
-// ───────────────────────────────────────────────────────────────────────────
-const addonRouter = getRouter(addonInterface);
-app.use(addonRouter);
+// ── Stremio Addon SDK ─────────────────────────────────────────────────────────
+app.use(getRouter(addonInterface));
 
 app.listen(PORT, () => {
   console.log('');
-  console.log('╔══════════════════════════════════════════════════╗');
-  console.log('║       Stremio Addon – AniTube + SuperFlix BR  v8.0.0       ║');
-  console.log('╠══════════════════════════════════════════════════╣');
-  console.log('║  ✅  Servidor rodando com PROXY HLS corrigido!   ║');
-  console.log('║  ✅  Player bypass SuperFlix ativado!            ║');
-  console.log('║                                                  ║');
-  console.log(`║  📋  Para instalar no Stremio (Desktop):         ║`);
-  console.log(`║      http://127.0.0.1:${PORT}/manifest.json         ║`);
-  console.log('╚══════════════════════════════════════════════════╝');
-  console.log('');
-  console.log(`  PUBLIC_URL configurado: ${PUBLIC_URL}`);
-  console.log('  (Para acesso remoto, defina PUBLIC_URL no .env)');
+  console.log('╔═══════════════════════════════════════════════╗');
+  console.log('║      🎌 AniTube.news – Stremio Addon v4.0     ║');
+  console.log('╠═══════════════════════════════════════════════╣');
+  console.log(`║  Porta   : ${PORT}                               ║`);
+  console.log(`║  Instalar: ${PUBLIC_URL}/manifest.json`);
+  console.log('╚═══════════════════════════════════════════════╝');
   console.log('');
 });
