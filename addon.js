@@ -143,17 +143,19 @@ builder.defineStreamHandler(async ({ id, type }) => {
     else if (id.startsWith('tt')) {
       const parts   = id.split(':');
       const imdbId  = parts[0];
-      // CORREÇÃO: season/episode podem ser undefined — parse só se existir
       const season  = parts[1] !== undefined ? parseInt(parts[1], 10) : null;
       const episode = parts[2] !== undefined ? parseInt(parts[2], 10) : null;
-      // CORREÇÃO: isMovie determinado pelo type recebido, não pela ausência de season
-      // O Stremio pode enviar "tt123" sem season mesmo para séries em alguns contextos
       const isMovie = (type === 'movie');
 
-      // Busca em paralelo nos 7 provedores
-      streams = await getAllStreams(imdbId, type, season, episode);
+      // 1. Restaura o método funcional da v5 para o SuperFlix (via iframe embed)
+      const sfStreams = sf.buildSFStreams(imdbId, isMovie ? 'movie' : 'series', season, episode);
+      streams.push(...sfStreams);
 
-      // Fallback AniTube para séries/animes quando provedores retornam pouco
+      // 2. Busca em paralelo nos outros provedores via scrap (VidSrc, GoDrive, etc)
+      const scrapedStreams = await getAllStreams(imdbId, type, season, episode);
+      streams.push(...scrapedStreams);
+
+      // 3. Fallback AniTube para séries/animes quando provedores retornam pouco
       if (!isMovie && streams.length < 2) {
         const atStreams = await tryAniTube(imdbId, season, episode);
         streams.push(...atStreams);
