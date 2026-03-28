@@ -7,17 +7,17 @@
  * para filmes, séries, animes e doramas via ID IMDB ou TMDB.
  *
  * Endpoints documentados (superflixapi.run):
- *   Player filme  : /filme/{imdb_ou_tmdb}
- *   Player série  : /serie/{imdb_ou_tmdb}/{temporada}/{episodio}
- *   Lista IDs     : /lista?category=movie|serie|anime&type=imdb|tmdb&format=json
- *   Calendário    : /calendario.php  (episódios recentes/futuros)
+ * Player filme  : /filme/{imdb_ou_tmdb}
+ * Player série  : /serie/{imdb_ou_tmdb}/{temporada}/{episodio}
+ * Lista IDs     : /lista?category=movie|serie|anime&type=imdb|tmdb&format=json
+ * Calendário    : /calendario.php  (episódios recentes/futuros)
  *
  * Vantagens sobre scraping:
- *   ✅ Sem Cloudflare / sem 403
- *   ✅ Aceita IDs IMDB nativamente (compatível com Cinemeta)
- *   ✅ Catálogo com lista de IDs disponíveis
- *   ✅ Domínio estável
- *   ✅ Sem necessidade de proxy (streams são diretos)
+ * ✅ Sem Cloudflare / sem 403
+ * ✅ Aceita IDs IMDB nativamente (compatível com Cinemeta)
+ * ✅ Catálogo com lista de IDs disponíveis
+ * ✅ Domínio estável
+ * ✅ Sem necessidade de proxy (streams são diretos)
  */
 
 const fetch = require('node-fetch');
@@ -54,12 +54,6 @@ async function safeFetch(url, opts = {}, timeout = 12000) {
 }
 
 // ── Lista de IDs disponíveis na SuperFlixAPI ─────────────────────────────────
-
-/**
- * Busca a lista de IDs de uma categoria no SuperFlixAPI.
- * Retorna array de strings de IDs (IMDB format: "tt0000000").
- * @param {'movie'|'serie'|'anime'} category
- */
 async function fetchIdList(category) {
   const now = Date.now();
   if (_listCache[category] && now - _listCacheTs[category] < LIST_TTL) {
@@ -74,7 +68,6 @@ async function fetchIdList(category) {
     const text = await res.text();
     let ids = [];
 
-    // A resposta pode ser um array JSON ou texto com IDs separados por linha/vírgula
     try {
       const json = JSON.parse(text);
       if (Array.isArray(json)) {
@@ -86,7 +79,6 @@ async function fetchIdList(category) {
         ids = Array.isArray(json.data) ? json.data : [];
       }
     } catch (_) {
-      // Fallback: texto com IDs
       ids = text.split(/[\n,\s]+/).map(s => s.trim()).filter(s => s.startsWith('tt'));
     }
 
@@ -101,7 +93,6 @@ async function fetchIdList(category) {
 }
 
 // ── Calendário (episódios recentes) ──────────────────────────────────────────
-
 let _calCache   = null;
 let _calCacheTs = 0;
 const CAL_TTL   = 30 * 60 * 1000; // 30 min
@@ -124,14 +115,9 @@ async function fetchCalendar() {
 }
 
 // ── Metadados via TMDB (enriquece catálogos com poster/nome) ─────────────────
-
 const _tmdbCache = new Map();
 const TMDB_TTL   = 24 * 60 * 60 * 1000; // 24h
 
-/**
- * Busca metadados de um título pelo ID IMDB.
- * Usa TMDB se a chave estiver configurada, senão usa Cinemeta (gratuito).
- */
 async function fetchMeta(imdbId, type) {
   const key    = `${imdbId}:${type}`;
   const cached = _tmdbCache.get(key);
@@ -141,7 +127,6 @@ async function fetchMeta(imdbId, type) {
     let meta = null;
 
     if (TMDB_KEY) {
-      // Via TMDB API
       const endpoint = type === 'movie'
         ? `https://api.themoviedb.org/3/find/${imdbId}?external_source=imdb_id&language=pt-BR`
         : `https://api.themoviedb.org/3/find/${imdbId}?external_source=imdb_id&language=pt-BR`;
@@ -166,7 +151,6 @@ async function fetchMeta(imdbId, type) {
     }
 
     if (!meta) {
-      // Fallback: Cinemeta (não precisa de chave)
       const cinType = type === 'movie' ? 'movie' : 'series';
       const res     = await safeFetch(`https://v3-cinemeta.strem.io/meta/${cinType}/${imdbId}.json`);
       if (res.ok) {
@@ -197,11 +181,6 @@ async function fetchMeta(imdbId, type) {
 }
 
 // ── Construir metas para catálogo Stremio ────────────────────────────────────
-
-/**
- * Dado um array de IDs IMDB, retorna metas enriquecidas com poster/nome.
- * Busca em lotes paralelos de 10 para não sobrecarregar.
- */
 async function buildMetas(imdbIds, type, page = 1, pageSize = 20) {
   const start   = (page - 1) * pageSize;
   const pageIds = imdbIds.slice(start, start + pageSize);
@@ -212,7 +191,6 @@ async function buildMetas(imdbIds, type, page = 1, pageSize = 20) {
     pageIds.map(async imdbId => {
       const meta = await fetchMeta(imdbId, type);
       if (!meta || !meta.name) {
-        // Sem metadados: retorna meta mínima com o ID
         return {
           id        : imdbId,
           type      : stremioType,
@@ -235,11 +213,10 @@ async function buildMetas(imdbIds, type, page = 1, pageSize = 20) {
   return results
     .filter(r => r.status === 'fulfilled')
     .map(r => r.value)
-    .filter(m => m.name && m.name !== m.id); // descarta sem nome
+    .filter(m => m.name && m.name !== m.id);
 }
 
 // ── Funções de catálogo ───────────────────────────────────────────────────────
-
 async function getMovies(page = 1) {
   const ids = await fetchIdList('movie');
   return buildMetas(ids, 'movie', page);
@@ -255,10 +232,6 @@ async function getAnimes(page = 1) {
   return buildMetas(ids, 'series', page);
 }
 
-/**
- * Episódios recentes (calendário) — ótimo para catálogo "Lançamentos".
- * Cada entrada tem: title, imdb_id, season, episode, date
- */
 async function getRecentEpisodes() {
   const calendar = await fetchCalendar();
 
@@ -285,10 +258,6 @@ async function getRecentEpisodes() {
   return results;
 }
 
-/**
- * Busca por título — usa TMDB search + filtra pelos IDs disponíveis na SF.
- * Se TMDB não estiver disponível, busca via Cinemeta.
- */
 async function searchContent(query, type) {
   if (!query?.trim()) return [];
 
@@ -314,7 +283,6 @@ async function searchContent(query, type) {
       }
     }
 
-    // Sem TMDB: usa Cinemeta search
     if (!results.length) {
       const cinType = type === 'movie' ? 'movie' : 'series';
       const res     = await safeFetch(
@@ -348,18 +316,6 @@ async function searchContent(query, type) {
 }
 
 // ── Geração de streams ────────────────────────────────────────────────────────
-
-/**
- * Gera as streams SuperFlixAPI para um conteúdo.
- * O player embed da SF já cuida de resolver o stream internamente.
- *
- * Para o Stremio, retornamos a URL do player como stream.
- * O Stremio consegue reproduzir iframes embed via behaviorHints.
- *
- * Retornamos múltiplos players (SF tem mirrors):
- *   - superflixapi.run (principal)
- *   - superflixapi.rest (espelho)
- */
 function buildSFStreams(imdbId, type, season, episode) {
   const streams = [];
   const isMovie = type === 'movie';
@@ -370,22 +326,24 @@ function buildSFStreams(imdbId, type, season, episode) {
   ];
 
   for (const { label, base } of endpoints) {
-    let url;
+    let sfUrl;
     if (isMovie) {
-      url = `${base}/filme/${imdbId}`;
+      sfUrl = `${base}/filme/${imdbId}`;
     } else {
       const s = season  || 1;
       const e = episode || 1;
-      url = `${base}/serie/${imdbId}/${s}/${e}`;
+      sfUrl = `${base}/serie/${imdbId}/${s}/${e}`;
     }
 
+    // Passa a URL do SuperFlix pelo player local para forçar o iframe e liberar o acesso
+    const proxyPlayerUrl = `${PUBLIC_URL}/player?url=${encodeURIComponent(sfUrl)}`;
+
     streams.push({
-      // externalUrl abre o player no browser — funciona no Stremio Desktop e Web
-      externalUrl: url,
+      externalUrl: proxyPlayerUrl,
       name       : `📺 ${label}`,
       description: isMovie
-        ? '🇧🇷 Dublado/Legendado • SuperFlixAPI'
-        : `🇧🇷 S${season || 1}E${episode || 1} • SuperFlixAPI`,
+        ? '🇧🇷 Dublado/Legendado • Abre no Navegador'
+        : `🇧🇷 S${season || 1}E${episode || 1} • Abre no Navegador`,
       behaviorHints: {
         notWebReady: false,
       },
