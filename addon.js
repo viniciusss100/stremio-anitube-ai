@@ -45,12 +45,10 @@ builder.defineStreamHandler(async ({ id }) => {
     return { streams };
 });
 
-// Exporta a interface do addon (contém a função handler)
-const interface = builder.getInterface();
+// Obtém a interface do addon
+const { handler } = builder.getInterface();
 
-// Exporta o handler diretamente (para Vercel)
-module.exports = interface.handler;
-
-// Mantém também o builder exportado para uso local (opcional)
-module.exports.builder = builder;
-module.exports.interface = interface;
+// Exporta o handler diretamente (para Vercel) e também guarda o builder para uso local
+module.exports = handler;
+// Guarda o builder em uma variável global (opcional, mas evita mexer em module.exports)
+global.__animesdigitalBuilder = builder;
