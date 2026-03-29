@@ -45,4 +45,12 @@ builder.defineStreamHandler(async ({ id }) => {
     return { streams };
 });
 
-module.exports = builder;
+// Exporta a interface do addon (contém a função handler)
+const interface = builder.getInterface();
+
+// Exporta o handler diretamente (para Vercel)
+module.exports = interface.handler;
+
+// Mantém também o builder exportado para uso local (opcional)
+module.exports.builder = builder;
+module.exports.interface = interface;
