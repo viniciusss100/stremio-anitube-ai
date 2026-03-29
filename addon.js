@@ -45,8 +45,4 @@ builder.defineStreamHandler(async ({ id }) => {
     return { streams };
 });
 
-// Obtém a função handler que o Vercel espera
-const { handler } = builder.getInterface();
-
-// Exporta APENAS a função handler (default export para Vercel)
-module.exports = handler;
+module.exports = builder;
