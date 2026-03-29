@@ -1,339 +1,37 @@
-'use strict';
+// src/extractor.js
+const axios = require('axios');
+const cheerio = require('cheerio');
 
-/**
- * Extrator de streams - v3.3.0
- * CORREÇÕES:
- *  - Proxy HLS usa PUBLIC_URL corretamente (não hardcoded 127.0.0.1)
- *  - behaviorHints corrigido para streams HLS via proxy
- *  - Melhor detecção de M3U8 em iframes genéricos
- */
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-const fetch  = require('node-fetch');
-const crypto = require('crypto');
-
-const UA_MOBILE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 ' +
-                  '(KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36';
-
-const FETCH_HEADERS = {
-  'User-Agent'     : UA_MOBILE,
-  Accept           : 'text/html,application/xhtml+xml,*/*;q=0.8',
-  'Accept-Language': 'pt-BR,pt;q=0.9',
-};
-
-const ITAG_QUALITY = {
-  37: 1080,
-  22: 720,
-  59: 480,
-  18: 360,
-};
-
-const QUALITY_LABEL = {
-  1080: 'FHD 1080p',
-  720 : 'HD 720p',
-  480 : 'SD 480p',
-  360 : 'SD 360p',
-};
-
-// PUBLIC_URL é lido do environment — permite acesso remoto quando configurado
-const PORT       = parseInt(process.env.PORT || '7000', 10);
-const PUBLIC_URL = (process.env.PUBLIC_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
-
-// ───────────────────────────────────────────────────────────────────────────
-// UTILITÁRIOS
-// ───────────────────────────────────────────────────────────────────────────
-
-async function safeFetch(url, opts = {}, timeout = 15000) {
-  const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function extractHLSFromVideoHLS(src) {
-  try {
-    const u = new URL(src.startsWith('//') ? 'https:' + src : src);
-    const d = u.searchParams.get('d');
-    if (d && d.startsWith('http')) return decodeURIComponent(d);
-  } catch (_) {
-    const m = src.match(/[?&]d=([^&]+)/);
-    if (m) {
-      try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
-    }
-  }
-  return null;
-}
-
-function extractBloggerToken(url) {
-  const m = url.match(/[?&]token=([^&]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
-
-function decodeGoogleVideoUrl(raw) {
-  let url = raw;
-  for (let i = 0; i < 4; i++) {
-    url = url.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
-      String.fromCharCode(parseInt(hex, 16))
-    );
-    url = url.replace(/\\\//g, '/');
-    url = url.replace(/\\\\/g, '\\');
-    url = url.replace(/\\=/g, '=');
-    url = url.replace(/\\&/g, '&');
-  }
-  return url.replace(/^"+|"+$/g, '').trim();
-}
-
-function extractItagFromUrl(url) {
-  const m = url.match(/[&?]itag[=%](\d+)/i) || url.match(/itag=(\d+)/);
-  return m ? parseInt(m[1], 10) : 18;
-}
-
-function extractVideoId(url) {
-  const m = url.match(/[?&]id=([a-f0-9]+)/);
-  return m ? m[1] : 'picasacid';
-}
-
-function generateCpn(token, videoId, timestamp) {
-  try {
-    const seed = `boq_bloggeruiserver_20260317.01_p0${videoId}${timestamp}${token}`;
-    const hash = crypto.createHash('sha256').update(seed).digest('base64');
-    return hash.replace(/[+/=]/g, '').substring(0, 16);
-  } catch (_) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    return Array.from({ length: 16 }, () =>
-      chars[Math.floor(Math.random() * chars.length)]
-    ).join('');
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// BLOGGER / GOOGLEVIDEO
-// ───────────────────────────────────────────────────────────────────────────
-
-function parseGoogleVideoUrls(responseText) {
-  const videos  = [];
-  const cleaned = responseText.replace(/^\)\]}'[\s\n]*/, '');
-
-  const wrbMatch = cleaned.match(/\[\s*\[\s*"wrb\.fr"\s*,[^,]+,\s*"([\s\S]+?)"\s*,\s*null/);
-  let jsonStr    = wrbMatch ? wrbMatch[1] : cleaned;
-
-  jsonStr = jsonStr.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-  jsonStr = jsonStr.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) =>
-    String.fromCharCode(parseInt(h, 16))
-  );
-
-  const urlPattern = /"((?:https?:(?:\\\/|\/))[^"]*?googlevideo[^"]*?)",\[(\d+)\]/g;
-  let m;
-  while ((m = urlPattern.exec(jsonStr)) !== null) {
-    const rawUrl = m[1];
-    const itag   = parseInt(m[2], 10);
-    const decoded = decodeGoogleVideoUrl(rawUrl);
-    if (decoded && decoded.includes('googlevideo.com')) {
-      videos.push({ url: decoded, itag, quality: ITAG_QUALITY[itag] || 360 });
-    }
-  }
-
-  if (videos.length === 0) {
-    const fallback = /https?:[^\s"'<>]*googlevideo\.com[^\s"'<>\\]+/g;
-    while ((m = fallback.exec(jsonStr)) !== null) {
-      const decoded = decodeGoogleVideoUrl(m[0]);
-      const itag    = extractItagFromUrl(decoded);
-      if (!videos.some(v => v.itag === itag)) {
-        videos.push({ url: decoded, itag, quality: ITAG_QUALITY[itag] || 360 });
-      }
-    }
-  }
-
-  const seen   = new Set();
-  const unique = videos.filter(v => {
-    if (seen.has(v.itag)) return false;
-    seen.add(v.itag);
-    return true;
-  });
-
-  const order = [37, 22, 59, 18];
-  unique.sort((a, b) => {
-    const ia = order.indexOf(a.itag);
-    const ib = order.indexOf(b.itag);
-    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
-  });
-
-  return unique;
-}
-
-async function fetchBloggerStreams(token, referer) {
-  const reqid  = Math.floor(10000 + Math.random() * 89999);
-  const bl     = 'boq_bloggeruiserver_20260317.01_p0';
-  const apiUrl = `https://www.blogger.com/_/BloggerVideoPlayerUi/data/batchexecute` +
-                 `?rpcids=WcwnYd&source-path=%2Fvideo.g&bl=${bl}&_reqid=${reqid}&rt=c`;
-  const body   = `f.req=[[[\"WcwnYd\",\"[\\\"${token}\\\"]\",null,\"generic\"]]]&`;
-
-  try {
-    const res = await safeFetch(apiUrl, {
-      method : 'POST',
-      headers: {
-        'User-Agent'    : UA_MOBILE,
-        'Content-Type'  : 'application/x-www-form-urlencoded;charset=UTF-8',
-        'x-same-domain' : '1',
-      },
-      body,
-    });
-    if (!res.ok) return [];
-    const text = await res.text();
-    return parseGoogleVideoUrls(text);
-  } catch (_) {
-    return [];
-  }
-}
-
-function makeGoogleVideoStream(tabName, { url, itag, quality }) {
-  const timestamp = Date.now();
-  const videoId   = extractVideoId(url);
-  const cpn       = generateCpn(videoId, videoId, timestamp);
-  const sep       = url.includes('?') ? '&' : '?';
-  const finalUrl  = `${url}${sep}cpn=${cpn}&c=WEB_EMBEDDED_PLAYER&cver=1.20260224.08.00`;
-  const label     = QUALITY_LABEL[quality] || `${quality}p`;
-
-  return {
-    url  : finalUrl,
-    name : `AniTube | ${tabName}`,
-    description: `GoogleVideo ${label}`,
-    behaviorHints: {
-      notWebReady: false,
-      proxyHeaders: {
-        request: {
-          Referer     : 'https://youtube.googleapis.com/',
-          'User-Agent': UA_MOBILE,
-        },
-      },
-    },
-  };
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// EXTRAÇÃO DE IFRAMES GENÉRICOS (Proxy AniTube → Blogger ou M3U8 direto)
-// ───────────────────────────────────────────────────────────────────────────
-
-async function extractFromProxyIframe(iframeSrc, episodeReferer) {
-  const streams = [];
-  try {
-    const res = await safeFetch(iframeSrc, {
-      headers  : { ...FETCH_HEADERS, Referer: episodeReferer || 'https://www.anitube.news/' },
-      redirect : 'follow',
-    });
-    if (!res.ok) return streams;
-    const html = await res.text();
-
-    // Tenta encontrar iframe do Blogger
-    const bloggerMatch = html.match(
-      /src=["'](https?:\/\/(?:www\.)?blogger\.com\/video\.g[^"']+)["']/i
-    );
-    if (bloggerMatch) {
-      const bloggerUrl = bloggerMatch[1].replace(/&amp;/g, '&');
-      const token = extractBloggerToken(bloggerUrl);
-      if (token) {
-        const googleVideos = await fetchBloggerStreams(token, episodeReferer);
-        for (const vid of googleVideos) {
-          streams.push(makeGoogleVideoStream('Player 1', vid));
-        }
-      }
-      return streams;
-    }
-
-    // CORREÇÃO: Busca mais abrangente por URLs M3U8 (inclui variações de query string)
-    const m3u8Patterns = [
-      /["'](https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*)/i,
-      /source\s+src=["'](https?:\/\/[^"']+\.m3u8[^"']*)/i,
-      /file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/i,
-      /hls\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)/i,
-    ];
-
-    for (const pattern of m3u8Patterns) {
-      const m3u8Match = html.match(pattern);
-      if (m3u8Match) {
-        const m3u8Url = m3u8Match[1];
-        // CORREÇÃO: Proxy corretamente via PUBLIC_URL
-        const proxyUrl = `${PUBLIC_URL}/proxy/m3u8?url=${encodeURIComponent(m3u8Url)}&referer=${encodeURIComponent(episodeReferer || 'https://www.anitube.news/')}`;
-        streams.push({
-          url        : proxyUrl,
-          name       : 'AniTube | Player 1',
-          description: 'HLS Stream (Via Proxy)',
-          // CORREÇÃO: notWebReady deve ser false quando usamos proxy local
-          // pois o proxy já serve o conteúdo de forma compatível
-          behaviorHints: { notWebReady: false },
+const extractVideoUrl = async (episodeUrl) => {
+    try {
+        const { data } = await axios.get(episodeUrl, {
+            headers: { 'User-Agent': USER_AGENT },
+            timeout: 10000
         });
-        break;
-      }
-    }
-  } catch (_) {}
-  return streams;
-}
+        const $ = cheerio.load(data);
 
-// ───────────────────────────────────────────────────────────────────────────
-// FUNÇÃO PRINCIPAL DE EXTRAÇÃO
-// ───────────────────────────────────────────────────────────────────────────
+        // Busca iframe do player
+        const iframeSrc = $('iframe.metaframe, iframe.rptss, #player1 iframe').attr('src');
+        if (!iframeSrc) return null;
 
-async function extractStreams(sources, episodeUrl) {
-  const streams       = [];
-  const episodeReferer = episodeUrl || 'https://www.anitube.news/';
-
-  for (const source of sources) {
-    const { name, iframeSrc } = source;
-    if (!iframeSrc) continue;
-
-    const fullIframeSrc = iframeSrc.startsWith('//') ? 'https:' + iframeSrc : iframeSrc;
-
-    // ── Tipo 1: videohls.php (FHD) — PROXY LOCAL HLS ──
-    if (fullIframeSrc.includes('videohls.php') || fullIframeSrc.includes('anivideo.net/videohls')) {
-      const hlsUrl = extractHLSFromVideoHLS(fullIframeSrc);
-      if (hlsUrl) {
-        // CORREÇÃO: Usa PUBLIC_URL (configurável via .env) em vez de 127.0.0.1 fixo
-        const proxyUrl = `${PUBLIC_URL}/proxy/m3u8` +
-                         `?url=${encodeURIComponent(hlsUrl)}` +
-                         `&referer=${encodeURIComponent('https://www.anitube.news/')}`;
-
-        streams.push({
-          url        : proxyUrl,
-          name       : `AniTube | ${name}`,
-          description: '[FHD] HLS Stream (Via Proxy Local)',
-          // CORREÇÃO: notWebReady: false — o proxy serve conteúdo acessível localmente
-          behaviorHints: { notWebReady: false },
-        });
-      }
-      continue;
-    }
-
-    // ── Tipo 2: proxy AniTube → Blogger ──
-    if (fullIframeSrc.includes('anitube.news/') && !fullIframeSrc.includes('videohls.php')) {
-      const extracted = await extractFromProxyIframe(fullIframeSrc, episodeReferer);
-      for (const s of extracted) {
-        streams.push({ ...s, name: `AniTube | ${name}` });
-      }
-      continue;
-    }
-
-    // ── Tipo 3: iframe Blogger direto ──
-    if (fullIframeSrc.includes('blogger.com/video.g')) {
-      const token = extractBloggerToken(fullIframeSrc);
-      if (token) {
-        const googleVideos = await fetchBloggerStreams(token, episodeReferer);
-        for (const vid of googleVideos) {
-          streams.push(makeGoogleVideoStream(name, vid));
+        // Extrai parâmetro 'd' da URL (ex: api.anivideo.net/videohls.php?d=...)
+        const urlParams = new URLSearchParams(iframeSrc.split('?')[1]);
+        let videoUrl = urlParams.get('d');
+        
+        if (!videoUrl && iframeSrc.includes('.m3u8')) {
+            videoUrl = iframeSrc;
         }
-      }
-      continue;
+
+        // Se o link for relativo, resolve
+        if (videoUrl && videoUrl.startsWith('//')) videoUrl = 'https:' + videoUrl;
+        
+        return videoUrl;
+    } catch (err) {
+        console.error(`Erro ao extrair vídeo de ${episodeUrl}:`, err.message);
+        return null;
     }
+};
 
-    // ── Tipo 4: Genérico (fallback) ──
-    const extracted = await extractFromProxyIframe(fullIframeSrc, episodeReferer);
-    for (const s of extracted) {
-      streams.push({ ...s, name: `AniTube | ${name}` });
-    }
-  }
-
-  return streams;
-}
-
-module.exports = { extractStreams };
+module.exports = { extractVideoUrl };
