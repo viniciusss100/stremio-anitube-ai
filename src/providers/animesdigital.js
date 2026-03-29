@@ -3,6 +3,7 @@
 /**
  * Provider animesdigital.org – v1.0.0
  * Catálogo e meta de animesdigitais para o Stremio via AniTube addon.
+ * IMPORTANTE: adapte os seletores CSS conforme o HTML do site.
  */
 
 const fetch   = require('node-fetch');
@@ -21,7 +22,7 @@ const FETCH_HEADERS = {
 };
 
 // ───────────────────────────────────────────────────────────────────────────
-// HTTP
+// HTTP com retry
 // ───────────────────────────────────────────────────────────────────────────
 
 async function fetchHTML(url, timeout = 15000, retries = 3) {
@@ -44,15 +45,15 @@ async function fetchHTML(url, timeout = 15000, retries = 3) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// UTILITÁRIOS (reutilizando o mesmo estilo de src/scraper.js)
+// UTILITÁRIOS
 // ───────────────────────────────────────────────────────────────────────────
 
 function cleanTitle(raw) {
   if (!raw || typeof raw !== 'string') return '';
   return raw
-    .replace(/\s*[-–]\s*Todos os Epis.+$/i, '')
-    .replace(/\s*[-–]\s*Epis[óo]dio\s*\d+.*$/i, '')
-    .replace(/\s*[-–]\s*Epis[óo]dios.*$/i, '')
+    .replace(/\s*[-–]\s*Todos os Epis.+\s*$/i, '')
+    .replace(/\s*[-–]\s*Epis[óo]dio\s*\d+.*/i, '')
+    .replace(/\s*[-–]\s*Epis[óo]dios.*/i, '')
     .replace(/&#8211;/g, '–')
     .replace(/&amp;/g, '&')
     .trim();
@@ -109,7 +110,9 @@ function parseEpisodesList($, $episodes) {
     const id   = extractEpisodeIdFromHref(href);
     if (!id || seen.has(id)) return;
     seen.add(id);
-    const rawTitle = $a.attr('title') || $a.find('.epiTitle').text().trim() || $a.text().trim();
+    const rawTitle = $a.attr('title') ||
+      $a.find('.epiTitle').text().trim() ||
+      $a.text().trim();
     const poster = extractImgSrc($(el).find('img').first());
     if (!rawTitle) return;
     results.push({
@@ -124,7 +127,7 @@ function parseEpisodesList($, $episodes) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// EXTRATORES DE ID
+// EXTRATORES DE ID (AJUSTE ESTES SEGUNS A URL REAL NAS PÁGINAS)
 // ───────────────────────────────────────────────────────────────────────────
 
 // Exemplo: /anime/one-piece-legendado/
@@ -132,7 +135,9 @@ function extractAnimeIdFromHref(href) {
   if (!href) return null;
   const m = href.match(/\/anime\/([^\/]+)\/?$/i);
   const slug = m ? m[1] : null;
-  return slug ? slug.replace(/-legendado|-dublado$/i, '').replace(/-/g, '_') : null;
+  return slug
+    ? slug.replace(/-legendado|-dublado$/i, '').replace(/-/g, '_')
+    : null;
 }
 
 // Exemplo: /episodio/one-piece-leg-1-899/
@@ -140,7 +145,9 @@ function extractEpisodeIdFromHref(href) {
   if (!href) return null;
   const m = href.match(/\/episodio\/([^\/]+)\/?$/i);
   const slug = m ? m[1] : null;
-  return slug ? slug.replace(/-leg|-dub/i, '').replace(/-/g, '_') : null;
+  return slug
+    ? slug.replace(/-leg|-dub/i, '').replace(/-/g, '_')
+    : null;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -150,13 +157,13 @@ function extractEpisodeIdFromHref(href) {
 async function getLatestEpisodes() {
   const html = await fetchHTML(BASE_URL);
   const $    = cheerio.load(html);
-  return parseEpisodesList($, $('.recent-episodes .episode')); // ajuste seletor conforme site
+  return parseEpisodesList($, $('.recent-episodes .episode')); // 🔧 ajustar conforme HTML real
 }
 
 async function getRecentAnimes() {
   const html = await fetchHTML(BASE_URL);
   const $    = cheerio.load(html);
-  return parseAnimesList($, $('.recent-animes .anime-item')); // ajuste seletor conforme site
+  return parseAnimesList($, $('.recent-animes .anime-item')); // 🔧 ajustar
 }
 
 async function getAnimeList(page = 1) {
@@ -165,7 +172,7 @@ async function getAnimeList(page = 1) {
     : `${BASE_URL}/animes/page/${page}/`;
   const html = await fetchHTML(url);
   const $ = cheerio.load(html);
-  return parseAnimesList($, $('.anime-list .anime-item'));
+  return parseAnimesList($, $('.anime-list .anime-item')); // 🔧 ajustar
 }
 
 async function searchAnimes(query) {
@@ -173,10 +180,13 @@ async function searchAnimes(query) {
   const url = `${BASE_URL}?s=${encodeURIComponent(query.trim())}`;
   const html = await fetchHTML(url);
   const $ = cheerio.load(html);
+
   const animeResults = parseAnimesList($, $('.search-animes .anime-item'));
   if (animeResults.length > 0) return animeResults;
+
   const episodeResults = parseEpisodesList($, $('.search-episodes .episode'));
   if (episodeResults.length > 0) return episodeResults;
+
   return [];
 }
 
@@ -225,7 +235,7 @@ async function getAnimeMeta(animeId) {
       title    : `Episódio ${epNum}`,
       season   : 1,
       episode  : epNum,
-      released : new Date(0).toISOString(),
+      released : new Date(0).toISOString(), // idealmente, use data real do site se houver
     });
   });
 
@@ -258,15 +268,18 @@ async function getAnimeMeta(animeId) {
   };
 }
 
-// função de src/scraper.js que você pode copiar para cá ou reutilizar
+// ───────────────────────────────────────────────────────────────────────────
+// UTILITÁRIO: extrai número de episódio do título
+// ───────────────────────────────────────────────────────────────────────────
+
 function extractEpisodeNumber(title) {
   if (!title) return null;
   const patterns = [
     /Epis[oó]dio\s*(\d+)/i,
     /Ep\.?\s*(\d+)/i,
-    /\bE(\d+)\b/i,
-    /\b(\d{3,})\b/,
-    /\b(\d{1,2})\b/,
+    /E(\d+)/i,
+    /(\d{3,})/,   // por exemplo: 012, 899 etc.
+    /(\d{1,2})/,  // 1..99
   ];
   for (const p of patterns) {
     const m = title.match(p);
@@ -285,7 +298,7 @@ module.exports = {
   getAnimeList,
   searchAnimes,
   getAnimeMeta,
-  // utilitários para testes e reaproveitamento
+  // para testes e reuso interno
   extractAnimeIdFromHref,
   extractEpisodeIdFromHref,
   fetchHTML,
