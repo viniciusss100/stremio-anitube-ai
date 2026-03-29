@@ -1,14 +1,19 @@
 {
-  "name": "stremio-animesdigital",
-  "version": "1.0.0",
-  "description": "Stremio addon for animesdigital.org",
-  "main": "index.js",
+  "name": "stremio-anitube",
+  "version": "4.0.0",
+  "description": "Stremio Addon para AniTube.news — animes em português",
+  "main": "addon.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js",
+    "dev":   "node server.js"
   },
   "dependencies": {
-    "axios": "^1.6.2",
-    "cheerio": "^1.0.0-rc.12",
-    "stremio-addon-sdk": "^1.6.3"
-  }
+    "cheerio":          "^1.0.0",
+    "dotenv":           "^17.3.1",
+    "express":          "^4.18.2",
+    "node-fetch":       "^2.7.0",
+    "stremio-addon-sdk":"^1.6.10"
+  },
+  "engines": { "node": "24" },
+  "license": "MIT"
 }
