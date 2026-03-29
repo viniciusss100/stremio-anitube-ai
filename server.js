@@ -1,11 +1,13 @@
 // server.js
 const builder = require('./addon');
 
-// Exporta o handler HTTP para ser usado no Vercel (serverless)
-// O método getInterface() retorna um objeto com a função 'handler'
-module.exports = builder.getInterface();
+// Obtém a interface do addon (contém a função handler)
+const { handler } = builder.getInterface();
 
-// Se estiver rodando localmente (não em produção), inicia o servidor HTTP
+// Exporta a função handler para o Vercel (serverless)
+module.exports = handler;
+
+// Se estiver rodando localmente (NODE_ENV diferente de 'production'), inicia o servidor HTTP
 if (process.env.NODE_ENV !== 'production') {
     const { serveHTTP } = require('stremio-addon-sdk');
     const port = process.env.PORT || 7000;
