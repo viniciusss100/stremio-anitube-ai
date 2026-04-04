@@ -220,16 +220,18 @@ async function resolveImdbTitle(imdbId) {
 }
 
 // Resolve título e aliases de um ID Kitsu
+// FIX: a URL usava "/meta/anime/" mas o Kitsu addon serve sob "/meta/series/",
+//      que é o type correto registrado no Stremio para séries de anime.
 async function resolveKitsuTitle(kitsuId) {
   try {
     const r = await fetch(
-      `https://anime-kitsu.strem.fun/meta/anime/${kitsuId}.json`,
+      `https://anime-kitsu.strem.fun/meta/series/${kitsuId}.json`, // era "anime", corrigido para "series"
       { timeout: 8000 }
     );
     if (!r.ok) return { title: null, aliases: [] };
     const j = await r.json();
     return {
-      title  : j?.meta?.name   || null,
+      title  : j?.meta?.name    || null,
       aliases: j?.meta?.aliases || [],
     };
   } catch (_) {
@@ -292,20 +294,25 @@ async function searchAndExtract(title, aliases, season, episode) {
   console.log(`[AniTube] Match: "${matchedQuery}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
 
   const animeId = bestMatch.id.replace('anitube:', '');
-  const epId    = await resolveEpisodeId(animeId, episode);
+  // FIX: season agora é passado para resolveEpisodeId
+  const epId    = await resolveEpisodeId(animeId, season, episode);
   return extractAniTubeById(epId);
 }
 
-// Resolve o ID do episódio correto dentro de um anime
-async function resolveEpisodeId(animeId, episode) {
+// Resolve o ID do episódio correto dentro de um anime.
+// FIX: adicionado parâmetro `season`; a busca agora prioriza season+episode,
+//      depois episode isolado (compatibilidade com séries de temporada única),
+//      e por último fallback por índice.
+async function resolveEpisodeId(animeId, season, episode) {
   if (!episode || episode <= 0) return animeId;
   try {
     const meta   = await scraper.getAnimeMeta(animeId);
     const videos = meta?.meta?.videos || [];
     if (!videos.length) return animeId;
 
-    const ep = videos.find(v => v.episode === episode)
-            || videos[episode - 1]
+    const ep = videos.find(v => v.season === season && v.episode === episode) // season + episode (exato)
+            || videos.find(v => v.episode === episode)                        // só episode (séries de 1 temporada)
+            || videos[episode - 1]                                            // fallback por índice
             || videos[0];
     return ep ? ep.id.replace('anitube:', '') : animeId;
   } catch (_) {
