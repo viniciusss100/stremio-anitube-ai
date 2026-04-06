@@ -5,9 +5,32 @@ const scraper = require('./src/scraper');
 const { extractStreams } = require('./src/extractor');
 const fetch = require('node-fetch');
 
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+  'Accept': 'application/json,text/plain,*/*',
+  'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+  'Referer': 'https://kitsufortheweebs.midnightignite.me/',
+  'Origin': 'https://kitsufortheweebs.midnightignite.me',
+};
+
+const KITSU_BASE_URL = 'https://kitsufortheweebs.midnightignite.me';
+
+async function fetchJson(url, headers = {}) {
+  const r = await fetch(url, {
+    timeout: 8000,
+    headers: { ...BROWSER_HEADERS, ...headers },
+  });
+
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status} for ${url}`);
+  }
+
+  return r.json();
+}
+
 // ── Cache em memória ──────────────────────────────────────────────────────────
 const cache     = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 min
+const CACHE_TTL = 2 * 60 * 1000; // 2 min
 
 function cacheGet(key) {
   const entry = cache.get(key);
@@ -22,58 +45,24 @@ function cacheSet(key, value) {
 // ── Manifest ──────────────────────────────────────────────────────────────────
 const manifest = {
   id         : 'community.anitube.news',
-  version    : '4.0.0',
+  version    : '4.2.3',
   name       : '🎌 AniTube.news',
   description: 'Animes dublados e legendados do AniTube.news. Funciona nos catálogos do Stremio, Cinemeta e Kitsu.',
-  logo       : 'https://www.anitube.news/wp-content/uploads/logo-anitube-2.png',
-  background : 'https://www.anitube.news/wp-content/themes/anitube/img/bg.jpg',
+  logo       : '',
+  background : '',
 
   resources  : ['catalog', 'meta', 'stream'],
-  types      : ['series'],
+  types      : ['series', 'anime'],
 
-  // idPrefixes define para quais IDs externos o Stremio vai chamar nosso streamHandler.
-  // 'anitube:' → catálogos próprios
-  // 'tt'       → Cinemeta (IDs IMDB) — o addon aparece ao abrir uma série no Cinemeta
-  // 'kitsu:'   → Kitsu addon — o addon aparece ao abrir um anime no Kitsu
-  idPrefixes : ['anitube:', 'tt', 'kitsu:'],
+  idPrefixes : ['anitube:', 'tt', 'kitsu', 'kitsu:', 'mal', 'mal:', 'anilist', 'anilist:', 'anidb', 'anidb:'],
 
   behaviorHints: { configurable: false, adult: false },
 
   catalogs: [
-    // Todos os catálogos têm "search" habilitado.
-    // Isso faz com que o addon apareça nos resultados ao pesquisar
-    // em QUALQUER catálogo do Stremio (incluindo Cinemeta e Kitsu).
     {
       id   : 'anitube_ultimos',
-      type : 'series',
+      type : 'anime',
       name : '🆕 AniTube – Últimos Episódios',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
-    },
-    {
-      id   : 'anitube_mais_vistos',
-      type : 'series',
-      name : '🔥 AniTube – Mais Vistos',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
-    },
-    {
-      id   : 'anitube_recentes',
-      type : 'series',
-      name : '📺 AniTube – Animes Recentes',
-      extra: [
-        { name: 'search', isRequired: false },
-        { name: 'skip',   isRequired: false },
-      ],
-    },
-    {
-      id   : 'anitube_lista',
-      type : 'series',
-      name : '📚 AniTube – Lista Completa',
       extra: [
         { name: 'search', isRequired: false },
         { name: 'skip',   isRequired: false },
@@ -98,8 +87,6 @@ builder.defineCatalogHandler(async ({ id, extra = {} }) => {
     let metas = [];
 
     if (search) {
-      // Qualquer catálogo com search ativo retorna resultado de busca no AniTube.
-      // Isso é o que faz o addon aparecer ao pesquisar no Cinemeta/Kitsu/outros.
       metas = await scraper.searchAnimes(search);
     } else {
       switch (id) {
@@ -123,8 +110,7 @@ builder.defineCatalogHandler(async ({ id, extra = {} }) => {
 });
 
 // ── Meta Handler ──────────────────────────────────────────────────────────────
-builder.defineMetaHandler(async ({ id, type }) => {
-  // Só responde a IDs nativos do AniTube — outros ficam com o addon que os gerou.
+builder.defineMetaHandler(async ({ id }) => {
   if (!id.startsWith('anitube:')) return { meta: {} };
 
   const key    = `meta:${id}`;
@@ -153,33 +139,47 @@ builder.defineStreamHandler(async ({ id, type }) => {
     let streams = [];
 
     if (id.startsWith('anitube:')) {
-      // ── ID nativo: episódio já conhecido ──────────────────────────────────
       streams = await extractAniTubeById(id.replace('anitube:', ''));
 
     } else if (id.startsWith('tt')) {
-      // ── ID IMDB (Cinemeta) ────────────────────────────────────────────────
-      // Formato série: "tt1234567:1:3" (temporada 1, episódio 3)
-      // Formato filme: "tt1234567" (ignoramos — AniTube não tem filmes)
       const parts   = id.split(':');
       const imdbId  = parts[0];
       const season  = parts[1] ? parseInt(parts[1], 10) : null;
       const episode = parts[2] ? parseInt(parts[2], 10) : null;
 
-      if (type === 'movie') return { streams: [] }; // AniTube não tem filmes
+      if (type === 'movie') return { streams: [] };
 
-      const { title, aliases } = await resolveImdbTitle(imdbId);
-      if (title) streams = await searchAndExtract(title, aliases, season, episode);
+      const meta = await resolveImdbTitle(imdbId);
+      if (meta.title && isLikelyAnimeMeta(meta)) {
+        const enriched = await enrichWithKitsuAliases(meta, imdbId);
+        streams = await searchAndExtract(enriched.title, enriched.aliases, season, episode);
+      }
 
-    } else if (id.startsWith('kitsu:')) {
-      // ── ID Kitsu ──────────────────────────────────────────────────────────
-      // Formato: "kitsu:12345:1:3" (série 12345, temp. 1, ep. 3)
-      const parts   = id.split(':');
-      const kitsuId = `${parts[0]}:${parts[1]}`; // "kitsu:12345"
-      const season  = parts[2] ? parseInt(parts[2], 10) : 1;
-      const episode = parts[3] ? parseInt(parts[3], 10) : 1;
+    } else if (
+      id.startsWith('kitsu:') ||
+      id.startsWith('mal:') ||
+      id.startsWith('anilist:') ||
+      id.startsWith('anidb:')
+    ) {
+      const parts = id.split(':');
+      const provider = parts[0];
+      const seriesId = parts[1];
+      const externalId = `${provider}:${seriesId}`;
 
-      const { title, aliases } = await resolveKitsuTitle(kitsuId);
-      if (title) streams = await searchAndExtract(title, aliases, season, episode);
+      let season = 1;
+      let episode = null;
+
+      if (parts.length === 4) {
+        season = parseInt(parts[2], 10) || 1;
+        episode = parseInt(parts[3], 10) || null;
+      } else if (parts.length === 3) {
+        episode = parseInt(parts[2], 10) || null;
+      }
+
+      const { title, aliases } = await resolveKitsuTitle(externalId);
+      if (title) {
+        streams = await searchAndExtract(title, aliases, season, episode);
+      }
     }
 
     if (!streams.length) return { streams: [] };
@@ -201,7 +201,6 @@ async function extractAniTubeById(epId) {
   return extractStreams(sr.sources, sr.episodeUrl);
 }
 
-// Resolve título e aliases de um ID IMDB via Cinemeta
 async function resolveImdbTitle(imdbId) {
   try {
     const r = await fetch(
@@ -210,52 +209,66 @@ async function resolveImdbTitle(imdbId) {
     );
     if (!r.ok) return { title: null, aliases: [] };
     const j = await r.json();
+    const meta = j?.meta || {};
     return {
-      title  : j?.meta?.name    || null,
-      aliases: j?.meta?.aliases || [],
+      title      : meta.name || null,
+      aliases    : meta.aliases || [],
+      genres     : normalizeToArray(meta.genres || meta.genre || []),
+      countries  : normalizeToArray(meta.countries || meta.country || []),
+      description: meta.description || '',
     };
   } catch (_) {
-    return { title: null, aliases: [] };
+    return { title: null, aliases: [], genres: [], countries: [], description: '' };
   }
 }
 
-// Resolve título e aliases de um ID Kitsu
-// FIX: a URL usava "/meta/anime/" mas o Kitsu addon serve sob "/meta/series/",
-//      que é o type correto registrado no Stremio para séries de anime.
-async function resolveKitsuTitle(kitsuId) {
+async function enrichWithKitsuAliases(meta, imdbId) {
+  const aliases = Array.isArray(meta?.aliases) ? meta.aliases.filter(a => typeof a === 'string') : [];
+  if (aliases.length > 0) return { title: meta.title, aliases };
+
   try {
-    const r = await fetch(
-      `https://anime-kitsu.strem.fun/meta/series/${kitsuId}.json`, // era "anime", corrigido para "series"
-      { timeout: 8000 }
+    const j = await fetchJson(
+      `${KITSU_BASE_URL}/catalog/series/kitsu-anime-list/search=${encodeURIComponent(meta.title)}.json`
     );
-    if (!r.ok) return { title: null, aliases: [] };
-    const j = await r.json();
+    const match = (j?.metas || []).find(item => item?.imdb_id === imdbId)
+      || (j?.metas || []).find(item => normalize(item?.name || '') === normalize(meta.title));
+
+    if (!match) return { title: meta.title, aliases };
+
+    const enrichedAliases = Array.isArray(match.aliases)
+      ? match.aliases.filter(a => typeof a === 'string')
+      : [];
+
     return {
-      title  : j?.meta?.name    || null,
-      aliases: j?.meta?.aliases || [],
+      title: match.name || meta.title,
+      aliases: enrichedAliases.length ? enrichedAliases : aliases,
     };
   } catch (_) {
+    return { title: meta.title, aliases };
+  }
+}
+
+async function resolveKitsuTitle(externalId) {
+  try {
+    const j = await fetchJson(`${KITSU_BASE_URL}/meta/anime/${externalId}.json`);
+    return {
+      title: j?.meta?.name || null,
+      aliases: Array.isArray(j?.meta?.aliases) ? j.meta.aliases : [],
+    };
+  } catch (e) {
+    console.warn(`[Kitsu] Failed to resolve ${externalId}: ${e.message}`);
     return { title: null, aliases: [] };
   }
 }
 
 // ── Busca com verificação de relevância ───────────────────────────────────────
-//
-// Problema que isso resolve:
-//   "Demon Slayer" → AniTube retorna "Slayers" como primeiro resultado
-//   porque o site usa o nome JP "Kimetsu no Yaiba".
-//
-// Solução:
-//   1. Gera queries priorizando aliases JP (que é como o AniTube cataloga)
-//   2. Para cada query, verifica se algum resultado tem similaridade suficiente
-//      com qualquer forma conhecida do título (EN + aliases)
-//   3. Só aceita um resultado se ele passa no threshold de similaridade
 
-const SIMILARITY_THRESHOLD = 0.45; // 0 = nada em comum, 1 = idêntico
+const SIMILARITY_THRESHOLD = 0.45;
+const EPISODE_FALLBACK_THRESHOLD = 0.35;
 
 async function searchAndExtract(title, aliases, season, episode) {
   const queries   = buildQueries(title, aliases);
-  const allTitles = buildAllTitles(title, aliases); // todas as formas conhecidas do anime
+  const allTitles = buildAllTitles(title, aliases);
 
   let bestMatch = null;
   let bestScore = 0;
@@ -270,7 +283,6 @@ async function searchAndExtract(title, aliases, season, episode) {
     }
     if (!results?.length) continue;
 
-    // Para cada resultado, calcula o score máximo contra todas as formas do título
     for (const candidate of results) {
       const candidateName = candidate.name || '';
       const score = allTitles.reduce((max, t) => Math.max(max, similarity(t, candidateName)), 0);
@@ -282,27 +294,85 @@ async function searchAndExtract(title, aliases, season, episode) {
       }
     }
 
-    // Se encontrou match forte o suficiente, para de buscar
     if (bestScore >= SIMILARITY_THRESHOLD) break;
   }
 
   if (!bestMatch || bestScore < SIMILARITY_THRESHOLD) {
     console.warn(`[AniTube] Sem match confiável para "${title}" (melhor score: ${bestScore.toFixed(2)})`);
-    return [];
+    return episode ? searchEpisodeDirect(title, aliases, season, episode) : [];
   }
 
   console.log(`[AniTube] Match: "${matchedQuery}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
 
   const animeId = bestMatch.id.replace('anitube:', '');
-  // FIX: season agora é passado para resolveEpisodeId
   const epId    = await resolveEpisodeId(animeId, season, episode);
+  const streams = await extractAniTubeById(epId);
+
+  if (streams.length || !episode) return streams;
+  return searchEpisodeDirect(title, aliases, season, episode);
+}
+
+async function searchEpisodeDirect(title, aliases, season, episode) {
+  const queries   = buildEpisodeQueries(title, aliases, episode);
+  const allTitles = buildAllTitles(title, aliases);
+
+  let bestMatch = null;
+  let bestScore = 0;
+  let matchedQuery = '';
+
+  for (const q of queries) {
+    let results;
+    try {
+      results = await scraper.searchAnimes(q);
+    } catch (_) {
+      continue;
+    }
+    if (!results?.length) continue;
+
+    for (const candidate of results) {
+      const candidateTitle = scraper.cleanTitle(candidate.name || '');
+      const score = allTitles.reduce((max, t) => Math.max(max, similarity(t, candidateTitle)), 0);
+
+      if (looksLikeEpisodeResult(candidate.name)) {
+        const candidateEpisode = extractEpisodeFromName(candidate.name);
+        if (candidateEpisode !== episode) continue;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMatch = candidate;
+          matchedQuery = q;
+        }
+        continue;
+      }
+
+      if (!isSeasonCompatible(candidate.name, season)) continue;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = candidate;
+        matchedQuery = q;
+      }
+    }
+
+    if (bestScore >= EPISODE_FALLBACK_THRESHOLD) break;
+  }
+
+  if (!bestMatch || bestScore < EPISODE_FALLBACK_THRESHOLD) {
+    console.warn(`[AniTube] Sem match de episódio para "${title}" ep ${episode} (melhor score: ${bestScore.toFixed(2)})`);
+    return [];
+  }
+
+  console.log(`[AniTube] Match direto de episódio: "${matchedQuery}" → "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
+
+  if (looksLikeEpisodeResult(bestMatch.name)) {
+    return extractAniTubeById(bestMatch.id.replace('anitube:', ''));
+  }
+
+  const animeId = bestMatch.id.replace('anitube:', '');
+  const epId = await resolveEpisodeId(animeId, season, episode);
   return extractAniTubeById(epId);
 }
 
-// Resolve o ID do episódio correto dentro de um anime.
-// FIX: adicionado parâmetro `season`; a busca agora prioriza season+episode,
-//      depois episode isolado (compatibilidade com séries de temporada única),
-//      e por último fallback por índice.
 async function resolveEpisodeId(animeId, season, episode) {
   if (!episode || episode <= 0) return animeId;
   try {
@@ -310,9 +380,9 @@ async function resolveEpisodeId(animeId, season, episode) {
     const videos = meta?.meta?.videos || [];
     if (!videos.length) return animeId;
 
-    const ep = videos.find(v => v.season === season && v.episode === episode) // season + episode (exato)
-            || videos.find(v => v.episode === episode)                        // só episode (séries de 1 temporada)
-            || videos[episode - 1]                                            // fallback por índice
+    const ep = videos.find(v => v.season === season && v.episode === episode)
+            || videos.find(v => v.episode === episode)
+            || videos[episode - 1]
             || videos[0];
     return ep ? ep.id.replace('anitube:', '') : animeId;
   } catch (_) {
@@ -320,13 +390,10 @@ async function resolveEpisodeId(animeId, season, episode) {
   }
 }
 
-// Gera queries de busca ordenadas por probabilidade de match no AniTube.
-// Prioridade: aliases JP > título EN simplificado > título EN completo.
-// O AniTube cataloga animes pelo nome JP — aliases costumam tê-lo.
 function buildQueries(title, aliases) {
   const seen    = new Set();
-  const jpFirst = []; // aliases (geralmente JP) — têm prioridade
-  const enLast  = []; // título EN
+  const jpFirst = [];
+  const enLast  = [];
 
   function addTo(arr, s) {
     if (!s || s.length < 2) return;
@@ -334,7 +401,6 @@ function buildQueries(title, aliases) {
     if (!seen.has(clean)) { seen.add(clean); arr.push(clean); }
   }
 
-  // Aliases primeiro (incluem nome JP que o AniTube usa)
   if (Array.isArray(aliases)) {
     for (const a of aliases) {
       if (typeof a !== 'string') continue;
@@ -343,7 +409,6 @@ function buildQueries(title, aliases) {
     }
   }
 
-  // Título EN: versão simplificada (sem subtítulo) e completa
   addTo(enLast, title.replace(/\s*\(Dub\)/i, '').split(':')[0].split(' - ')[0].trim());
   addTo(enLast, title.replace(/\s*\(Dub\)/i, '').trim());
   addTo(enLast, title);
@@ -351,7 +416,27 @@ function buildQueries(title, aliases) {
   return [...jpFirst, ...enLast];
 }
 
-// Retorna todas as formas conhecidas do título, normalizadas para comparação
+function buildEpisodeQueries(title, aliases, episode) {
+  const seen = new Set();
+  const queries = [];
+
+  function add(query) {
+    const clean = (query || '').trim();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    queries.push(clean);
+  }
+
+  for (const base of buildQueries(title, aliases)) {
+    add(`${base} ${episode}`);
+    add(`${base} episódio ${episode}`);
+    add(`${base} ep ${episode}`);
+    add(base);
+  }
+
+  return queries;
+}
+
 function buildAllTitles(title, aliases) {
   const titles = new Set();
 
@@ -375,7 +460,47 @@ function buildAllTitles(title, aliases) {
   return [...titles];
 }
 
-// Normaliza string para comparação: minúsculas, sem pontuação, sem artigos
+function extractEpisodeFromName(name) {
+  const value = scraper.extractEpisodeNumber(name || '');
+  return Number.isInteger(value) ? value : null;
+}
+
+function looksLikeEpisodeResult(name) {
+  const text = name || '';
+  return /epis[oó]dio|ep\.?\s*\d+/i.test(text) && !/todos os epis/i.test(text);
+}
+
+function isSeasonCompatible(name, season) {
+  const text = normalize(name || '');
+  if (!season || season <= 1) {
+    return !/\bseason\s*[2-9]\b|\btemporada\s*[2-9]\b|\bpart\s*[2-9]\b/.test(text);
+  }
+
+  return text.includes(` ${season}`)
+    || text.includes(`season ${season}`)
+    || text.includes(`temporada ${season}`)
+    || text.includes(`part ${season}`);
+}
+
+function isLikelyAnimeMeta(meta) {
+  const genres = Array.isArray(meta?.genres) ? meta.genres.map(normalize) : [];
+  const countries = Array.isArray(meta?.countries) ? meta.countries.map(normalize) : [];
+  const description = normalize(meta?.description || '');
+
+  if (genres.some(g => g.includes('anime'))) return true;
+  if (genres.some(g => g.includes('animation') || g.includes('animacao'))) return true;
+  if (countries.some(c => c.includes('japan') || c.includes('japao'))) return true;
+  if (description.includes('anime') || description.includes('japanese animation')) return true;
+
+  return false;
+}
+
+function normalizeToArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') return value.split(',').map(v => v.trim()).filter(Boolean);
+  return [];
+}
+
 function normalize(s) {
   return s
     .toLowerCase()
@@ -386,27 +511,22 @@ function normalize(s) {
     .trim();
 }
 
-// Similaridade entre dois strings — combina Jaccard (palavras) + Dice (bigrams).
-// Retorna valor entre 0 (nada em comum) e 1 (idênticos).
 function similarity(a, b) {
   const na = normalize(a);
   const nb = normalize(b);
   if (na === nb) return 1;
   if (!na || !nb) return 0;
 
-  // Containment: se um contém o outro integralmente
   if (na.includes(nb) || nb.includes(na)) {
     return Math.min(na.length, nb.length) / Math.max(na.length, nb.length);
   }
 
-  // Jaccard sobre palavras individuais — bom para títulos curtos
   const setA = new Set(na.split(' ').filter(Boolean));
   const setB = new Set(nb.split(' ').filter(Boolean));
   let wordInter = 0;
   for (const w of setA) if (setB.has(w)) wordInter++;
   const jaccard = wordInter / (setA.size + setB.size - wordInter);
 
-  // Dice sobre bigrams — bom para frases mais longas
   const bgA = new Set(bigrams(na));
   const bgB = new Set(bigrams(nb));
   let bgInter = 0;
@@ -416,10 +536,9 @@ function similarity(a, b) {
   return Math.max(jaccard, dice);
 }
 
-// Gera bigrams de palavras de uma string normalizada
 function bigrams(s) {
   const words = s.split(' ').filter(Boolean);
-  if (words.length === 1) return words; // palavra única: retorna ela mesma
+  if (words.length === 1) return words;
   const out = [];
   for (let i = 0; i < words.length - 1; i++) {
     out.push(`${words[i]} ${words[i + 1]}`);
