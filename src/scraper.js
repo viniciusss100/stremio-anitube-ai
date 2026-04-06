@@ -249,6 +249,14 @@ async function searchAnimes(query) {
   return parseEpiItems($);
 }
 
+async function searchEpisodeItems(query) {
+  if (!query || !query.trim()) return [];
+  const url  = `${BASE_URL}/?s=${encodeURIComponent(query.trim())}`;
+  const html = await fetchHTML(url);
+  const $    = cheerio.load(html);
+  return parseEpiItems($);
+}
+
 async function getAnimeMeta(animeId) {
   const url  = `${BASE_URL}/video/${animeId}/`;
   const html = await fetchHTML(url);
@@ -367,6 +375,7 @@ module.exports = {
   getRecentAnimes,
   getAnimeList,
   searchAnimes,
+  searchEpisodeItems,
   getAnimeMeta,
   getEpisodeIframes,
   // utilitários exportados para testes unitários

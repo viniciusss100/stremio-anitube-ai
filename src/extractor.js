@@ -27,6 +27,8 @@ const ITAG_QUALITY = {
   18: 360,
 };
 
+const MIN_STREAM_QUALITY = 480;
+
 const QUALITY_LABEL = {
   1080: 'FHD 1080p',
   720 : 'HD 720p',
@@ -153,14 +155,16 @@ function parseGoogleVideoUrls(responseText) {
     return true;
   });
 
-  const order = [37, 22, 59, 18];
-  unique.sort((a, b) => {
+  const filtered = unique.filter(v => (v.quality || 0) >= MIN_STREAM_QUALITY);
+
+  const order = [37, 22, 59];
+  filtered.sort((a, b) => {
     const ia = order.indexOf(a.itag);
     const ib = order.indexOf(b.itag);
     return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
   });
 
-  return unique;
+  return filtered;
 }
 
 async function fetchBloggerStreams(token, referer) {
@@ -194,20 +198,15 @@ function makeGoogleVideoStream(tabName, { url, itag, quality }) {
   const cpn       = generateCpn(videoId, videoId, timestamp);
   const sep       = url.includes('?') ? '&' : '?';
   const finalUrl  = `${url}${sep}cpn=${cpn}&c=WEB_EMBEDDED_PLAYER&cver=1.20260224.08.00`;
+  const proxyUrl  = `${PUBLIC_URL}/proxy/segment?url=${encodeURIComponent(finalUrl)}&referer=${encodeURIComponent('https://youtube.googleapis.com/')}`;
   const label     = QUALITY_LABEL[quality] || `${quality}p`;
 
   return {
-    url  : finalUrl,
+    url  : proxyUrl,
     name : `AniTube | ${tabName}`,
     description: `GoogleVideo ${label}`,
     behaviorHints: {
       notWebReady: false,
-      proxyHeaders: {
-        request: {
-          Referer     : 'https://youtube.googleapis.com/',
-          'User-Agent': UA_MOBILE,
-        },
-      },
     },
   };
 }
