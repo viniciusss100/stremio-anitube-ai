@@ -107,24 +107,41 @@ app.get('/proxy/segment', async (req, res) => {
   if (!url) return res.status(400).send('Parâmetro "url" obrigatório');
 
   try {
-    const upstream = await fetch(url, {
-      headers: {
-        'User-Agent': UA_PROXY,
-        'Referer'   : referer || 'https://www.anitube.news/',
-        'Origin'    : 'https://www.anitube.news',
-        'Accept'    : '*/*',
-      },
-    });
+    const headers = {
+      'User-Agent': UA_PROXY,
+      'Referer'   : referer || 'https://www.anitube.news/',
+      'Origin'    : 'https://www.anitube.news',
+      'Accept'    : '*/*',
+    };
 
-    if (!upstream.ok) {
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+
+    const upstream = await fetch(url, { headers });
+
+    if (!upstream.ok && upstream.status !== 206) {
       return res.status(upstream.status).send(`Upstream retornou ${upstream.status}`);
     }
 
-    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp2t');
+    res.status(upstream.status);
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
     res.setHeader('Cache-Control', 'public, max-age=3600');
 
-    const len = upstream.headers.get('content-length');
-    if (len) res.setHeader('Content-Length', len);
+    const passthroughHeaders = [
+      'content-length',
+      'content-range',
+      'accept-ranges',
+      'etag',
+      'last-modified',
+    ];
+
+    for (const header of passthroughHeaders) {
+      const value = upstream.headers.get(header);
+      if (value) {
+        res.setHeader(header, value);
+      }
+    }
 
     upstream.body.pipe(res);
 
